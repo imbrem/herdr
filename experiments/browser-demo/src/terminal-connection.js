@@ -3,7 +3,7 @@ import { DATA, RESIZE, PING, frame, FrameDecoder } from './frames.js';
 const APPLICATION_PROTOCOL = 'herdr-browser-pty-v1';
 const INPUT_LIMIT = 64 * 1024;
 const CHUNK_SIZE = 16 * 1024;
-const DEFAULT_TIMEOUTS = Object.freeze({ certificate: 5000, ready: 10_000, stream: 5000, auth: 5000, write: 5000 });
+const DEFAULT_TIMEOUTS = Object.freeze({ certificate: 5000, ready: 10_000, stream: 5000, auth: 5000, write: 5000, drain: 10_000 });
 
 function decodeBase64(value, minimum, maximum = minimum) {
   if (typeof value !== 'string' || value.length > Math.ceil(maximum / 3) * 4) {
@@ -114,6 +114,7 @@ export class TerminalConnection {
   #dispose(attachment) {
     if (attachment.closed) return;
     attachment.closed = true;
+    clearTimeout(attachment.drainTimer);
     if (this.#active === attachment) this.#active = undefined;
     attachment.signal?.removeEventListener('abort', attachment.onAbort);
     attachment.cancel(abortError());
@@ -129,6 +130,20 @@ export class TerminalConnection {
     const notify = attachment.opened;
     this.#dispose(attachment);
     if (notify) this.#onClose(error instanceof Error ? error : new Error('Connection closed.'));
+  }
+
+  #gracefullyClosed(attachment) {
+    if (attachment.closed) return;
+    if (!attachment.opened) {
+      this.#ended(attachment, new Error('Connection closed.'));
+      return;
+    }
+    // Transport closure may precede consumption of buffered receive bytes or
+    // completion of async terminal rendering. Stream EOF owns normal completion.
+    // Stop sending, but allow that tail to drain before cancelling the reader.
+    attachment.draining = true;
+    attachment.drainTimer = setTimeout(() => this.#ended(attachment,
+      new Error('Connection closed before terminal output drained.')), this.#timeouts.drain);
   }
 
   close() {
@@ -156,7 +171,7 @@ export class TerminalConnection {
       attachment.transport = transport;
       // Attach immediately, including while ready/authentication are pending.
       Promise.resolve(transport.closed).then(
-        () => this.#ended(attachment, new Error('Connection closed.')),
+        () => this.#gracefullyClosed(attachment),
         () => this.#ended(attachment, new Error('Connection lost.')),
       ).catch(() => {});
       await this.#wait(attachment, transport.ready, this.#timeouts.ready, 'WebTransport connection timed out.');
@@ -186,7 +201,7 @@ export class TerminalConnection {
 
   #queue(type, payload, beforeWrite) {
     const attachment = this.#active;
-    if (!attachment?.opened || attachment.closed) return false;
+    if (!attachment?.opened || attachment.closed || attachment.draining) return false;
     const packet = frame(type, payload);
     if (attachment.queued + packet.byteLength > INPUT_LIMIT) {
       this.#ended(attachment, new Error('Input queue full. Reconnect to continue.'));
@@ -195,18 +210,23 @@ export class TerminalConnection {
     attachment.queued += packet.byteLength;
     attachment.sending = attachment.sending.then(async () => {
       this.#guard(attachment);
+      if (attachment.draining) return;
       beforeWrite?.();
       await this.#wait(attachment, attachment.writer.write(packet), this.#timeouts.write, 'Terminal input write timed out.');
       if (type === DATA) this.#stats.sentBytes += payload.byteLength;
       this.#update();
-    }).catch(error => this.#ended(attachment, error)).finally(() => { attachment.queued -= packet.byteLength; });
+    }).catch(error => {
+      // Graceful transport shutdown may reject an outstanding input write even
+      // while its receive stream still has valid buffered output to present.
+      if (!attachment.draining) this.#ended(attachment, error);
+    }).finally(() => { attachment.queued -= packet.byteLength; });
     return true;
   }
 
   sendInput(bytes) {
     if (!(bytes instanceof Uint8Array)) throw new TypeError('Terminal input must be a Uint8Array.');
     const attachment = this.#active;
-    if (!attachment?.opened) return false;
+    if (!attachment?.opened || attachment.draining) return false;
     // Reject an oversized paste before sending any part of it.
     if (attachment.queued + bytes.byteLength + Math.ceil(bytes.byteLength / CHUNK_SIZE) * 5 > INPUT_LIMIT) {
       this.#ended(attachment, new Error('Input queue full. Reconnect to continue.'));
@@ -229,7 +249,7 @@ export class TerminalConnection {
 
   ping() {
     const attachment = this.#active;
-    if (!attachment?.opened) return false;
+    if (!attachment?.opened || attachment.draining) return false;
     const now = this.#now();
     for (const [key, sent] of attachment.pings) if (sent !== undefined && now - sent > 15_000) attachment.pings.delete(key);
     if (attachment.pings.size >= 4) return false;

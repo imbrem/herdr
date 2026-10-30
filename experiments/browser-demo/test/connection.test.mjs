@@ -325,3 +325,98 @@ test('slow terminal presentation applies backpressure and cancellation unblocks 
   assert.equal(context.endings.length, 0);
   blocked.resolve();
 });
+
+test('graceful transport closure drains buffered DATA and async presentation before onClose', async () => {
+  const presentations = [deferred(), deferred(), deferred()];
+  let presenting = 0;
+  const context = fixture({ onData: () => presentations[presenting++].promise });
+  await context.connection.open(bootstrap());
+  for (const byte of [1, 2, 3]) context.controller.enqueue(frame(DATA, new Uint8Array([byte])));
+  context.controller.close();
+  await tick();
+  assert.equal(context.data.length, 1);
+  context.closed.resolve();
+  await tick();
+  assert.equal(context.endings.length, 0);
+  assert.equal(context.readCancelled, 0);
+  assert.equal(context.connection.sendInput(new Uint8Array([4])), false);
+  assert.equal(context.connection.resize({ cols: 80, rows: 24 }), false);
+  assert.equal(context.connection.ping(), false);
+  for (let index = 0; index < presentations.length; index++) {
+    assert.equal(context.endings.length, 0);
+    presentations[index].resolve();
+    await tick();
+    assert.equal(context.data.length, Math.min(index + 2, 3));
+  }
+  assert.deepEqual(context.data.map(value => [...value]), [[1], [2], [3]]);
+  assert.equal(context.connection.stats.receivedBytes, 3);
+  assert.equal(context.endings.length, 1);
+  assert.match(context.endings[0].message, /Remote attachment ended/);
+});
+
+test('graceful closure bounds a stalled drain and still rejects unfinished setup promptly', async () => {
+  const blocked = deferred();
+  const context = fixture({ onData: () => blocked.promise, timeouts: { drain: 10 } });
+  await context.connection.open(bootstrap());
+  context.controller.enqueue(frame(DATA, new Uint8Array([1])));
+  await tick();
+  context.closed.resolve();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(context.endings.length, 1);
+  assert.match(context.endings[0].message, /before terminal output drained/);
+  blocked.resolve();
+  const setup = fixture({ ready: deferred().promise });
+  const opening = setup.connection.open(bootstrap());
+  for (let attempt = 0; attempt < 20 && setup.instances.length === 0; attempt++) await tick();
+  setup.closed.resolve();
+  await assert.rejects(opening, { name: 'AbortError' });
+  assert.equal(setup.endings.length, 0);
+});
+
+test('an input write failure during graceful shutdown does not discard receive output', async () => {
+  const input = deferred(), presentation = deferred();
+  const context = fixture({ write: (_value, count, output) => {
+    if (count === 1) output.enqueue(new Uint8Array([1]));
+    if (count > 2) return input.promise;
+  }, onData: () => presentation.promise });
+  await context.connection.open(bootstrap());
+  context.connection.sendInput(new Uint8Array([42]));
+  context.controller.enqueue(frame(DATA, new Uint8Array([43])));
+  context.controller.close();
+  await tick();
+  context.closed.resolve();
+  await tick();
+  input.reject(new Error('Stream closed for writing'));
+  await tick();
+  assert.equal(context.endings.length, 0);
+  presentation.resolve();
+  await tick();
+  assert.deepEqual([...context.data[0]], [43]);
+  assert.equal(context.endings.length, 1);
+});
+
+test('transport errors and explicit close still cancel presentation during a graceful drain', async () => {
+  const presentation = deferred();
+  const failed = fixture({ onData: () => presentation.promise });
+  await failed.connection.open(bootstrap());
+  failed.controller.enqueue(frame(DATA, new Uint8Array([1])));
+  await tick();
+  failed.closed.reject(new Error('Network lost'));
+  await tick();
+  assert.equal(failed.endings.length, 1);
+  assert.match(failed.endings[0].message, /Connection lost/);
+  assert.equal(failed.readCancelled, 1);
+  presentation.resolve();
+  const blocked = deferred();
+  const intentional = fixture({ onData: () => blocked.promise, timeouts: { drain: 10 } });
+  await intentional.connection.open(bootstrap());
+  intentional.controller.enqueue(frame(DATA, new Uint8Array([2])));
+  await tick();
+  intentional.closed.resolve();
+  await tick();
+  intentional.connection.close();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(intentional.endings.length, 0);
+  assert.equal(intentional.readCancelled, 1);
+  blocked.resolve();
+});
