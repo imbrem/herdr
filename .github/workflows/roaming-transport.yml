@@ -1,0 +1,23 @@
+name: Experimental WebTransport
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  transport:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check --package herdr-roam
+      - run: cargo clippy --locked --package herdr-roam --all-targets -- -D warnings
+      - run: cargo test --locked --package herdr-roam
+      - run: cargo build --locked --package herdr-roam
+      - run: HERDR_ROAM_TEST_BIN="$PWD/target/debug/herdr-roam" python3 scripts/test_roaming_transport.py

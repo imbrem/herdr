@@ -260,3 +260,11 @@ release $version $preview:
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Isolated experimental WebTransport helper checks (no Herdr server/PTY required).
+roam-check:
+    cargo fmt --check --package herdr-roam
+    cargo clippy --locked --package herdr-roam --all-targets -- -D warnings
+    cargo test --locked --package herdr-roam
+    cargo build --locked --package herdr-roam
+    HERDR_ROAM_TEST_BIN="{{justfile_directory()}}/target/debug/herdr-roam" {{python}} scripts/test_roaming_transport.py

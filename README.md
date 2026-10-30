@@ -1,3 +1,7 @@
+> **Experimental imbrem fork:** optional SSH-bootstrapped WebTransport remote
+> connections with named transport negotiation. See
+> [the experiment guide](TRANSPORT-EXPERIMENT.md). Stable SSH remains the default.
+
 # herdr
 
 
