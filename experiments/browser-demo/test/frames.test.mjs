@@ -24,3 +24,31 @@ test('oversized, unknown, malformed control and truncated frames fail closed', (
   assert.throws(() => decoder.finish(), /Incomplete terminal frame/);
   assert.throws(() => frame(DATA, new Uint8Array(65537)), /exceeds limit/);
 });
+
+test('maximum-size binary frame decodes across randomized boundaries', () => {
+  const payload = Uint8Array.from({ length: 65536 }, (_, i) => i % 256);
+  const source = new Uint8Array(5 + payload.length + 5 + 13);
+  source.set(frame(DATA, payload));
+  source.set(frame(HEARTBEAT), 5 + payload.length);
+  source.set(frame(PING, new Uint8Array(8).fill(73)), 10 + payload.length);
+  const decoder = new FrameDecoder(), received = [];
+  let seed = 1793;
+  for (let offset = 0; offset < source.length;) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const length = 1 + seed % 16384;
+    received.push(...decoder.push(source.subarray(offset, offset + length)));
+    offset += length;
+  }
+  decoder.finish();
+  assert.deepEqual(received.map(value => value.type), [DATA, HEARTBEAT, PING]);
+  assert.deepEqual(received[0].payload, payload);
+});
+
+test('invalid frame headers reject before an attacker supplies any payload', () => {
+  for (const [type, size] of [[0, 65536], [2, 4], [255, 1], [PING, 7], [HEARTBEAT, 1]]) {
+    const header = new Uint8Array(5);
+    header[0] = type;
+    new DataView(header.buffer).setUint32(1, size);
+    assert.throws(() => new FrameDecoder().push(header), /Invalid terminal frame/);
+  }
+});

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
+import { TRANSPORT_PROTOCOL } from './backend/config.mjs';
 
 export function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
@@ -13,24 +14,46 @@ export function remotePtyCommand({ session, cols, rows }) {
 }
 
 export function remoteCommand(config) {
-  return `env HERDR_ROAM_ALLOWED_ORIGIN=${shellQuote(config.origin)} herdr-roam serve --protocols webtransport-stream-v1 -- ${shellQuote(remotePtyCommand(config))}`;
+  return `env HERDR_ROAM_ALLOWED_ORIGIN=${shellQuote(config.origin)} herdr-roam serve --protocols ${TRANSPORT_PROTOCOL} -- ${shellQuote(remotePtyCommand(config))}`;
+}
+
+function base64Bytes(value, minimum, maximum = minimum) {
+  if (typeof value !== 'string' || value.length > Math.ceil(maximum / 3) * 4) return false;
+  const bytes = Buffer.from(value, 'base64');
+  return bytes.length >= minimum && bytes.length <= maximum && bytes.toString('base64') === value;
 }
 
 export function validateGreeting(greeting) {
-  if (greeting.selected_protocol !== 'webtransport-stream-v1' ||
-      !greeting.supported_protocols?.includes('webtransport-stream-v1')) {
-    throw new Error('Remote helper did not select webtransport-stream-v1.');
+  if (!greeting || greeting.selected_protocol !== TRANSPORT_PROTOCOL ||
+      !Array.isArray(greeting.supported_protocols) || !greeting.supported_protocols.includes(TRANSPORT_PROTOCOL)) {
+    throw new Error(`Remote helper did not select ${TRANSPORT_PROTOCOL}.`);
   }
   const offer = greeting.offer;
   // Bootstrap is authenticated SSH, but reject malformed data before handing it to a browser.
   if (!offer || offer.version !== 1 || !Number.isInteger(offer.port) || offer.port < 1 || offer.port > 65535 ||
       typeof offer.address !== 'string' || !isIP(offer.address) || ['0.0.0.0', '::'].includes(offer.address) ||
-      typeof offer.cert !== 'string' || typeof offer.token !== 'string' ||
-      Buffer.from(offer.token, 'base64').length !== 32 ||
-      Buffer.from(offer.cert, 'base64').length < 64 || Buffer.from(offer.cert, 'base64').length > 8192) {
+      !base64Bytes(offer.token, 32) || !base64Bytes(offer.cert, 64, 8192)) {
     throw new Error('Remote helper returned an invalid attachment offer.');
   }
   return offer;
+}
+
+/** Signal only the process/group this parent created; never a remote Herdr daemon. */
+function processStopper(child, grouped = false) {
+  let stopping = false;
+  return () => {
+    if (stopping || child.exitCode !== null || child.signalCode !== null) return;
+    stopping = true;
+    const signal = name => {
+      try { grouped && child.pid ? process.kill(-child.pid, name) : child.kill(name); } catch {}
+    };
+    signal('SIGTERM');
+    const timer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) signal('SIGKILL');
+    }, 500);
+    timer.unref();
+    child.once('exit', () => clearTimeout(timer));
+  };
 }
 
 // The target and remote command come only from trusted parent-process configuration.
@@ -41,21 +64,21 @@ function offerProcess(executable, args, env = process.env) {
   let collected = Buffer.alloc(0);
   let settled = false;
   let timer;
-  const close = () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    try { grouped && child.pid ? process.kill(-child.pid, 'SIGTERM') : child.kill(); } catch {}
-  };
+  let rejectOffer;
+  const stop = processStopper(child, grouped);
+  const close = () => { rejectOffer?.(new Error('Bootstrap cancelled.')); stop(); };
   const ready = new Promise((resolve, reject) => {
     const fail = error => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      close();
+      stop();
       reject(error);
     };
+    rejectOffer = fail;
     timer = setTimeout(() => fail(new Error('SSH bootstrap timed out. Verify SSH access and the remote helper.')), 12_000);
     child.once('error', () => fail(new Error('Could not start SSH.')));
-    child.once('exit', code => fail(new Error(`SSH bootstrap ended before an offer (exit ${code ?? 'signal'}).`)));
+    child.once('close', code => fail(new Error(`SSH bootstrap ended before an offer (exit ${code ?? 'signal'}).`)));
     // Drain errors without logging or returning arbitrary remote output or credentials.
     child.stderr.on('data', () => {});
     child.stdout.on('data', bytes => {
@@ -95,9 +118,10 @@ export function bootstrapRelay(config) {
     const preflight = spawn(config.sshPath ?? 'ssh', [
       '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-T', '--', config.target, 'true',
     ], { stdio: ['ignore', 'ignore', 'ignore'] });
-    activeClose = () => preflight.kill();
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { preflight.kill(); reject(new Error('SSH authorization check timed out.')); }, 12_000);
+      const stop = processStopper(preflight);
+      const timer = setTimeout(() => { stop(); reject(new Error('SSH authorization check timed out.')); }, 12_000);
+      activeClose = () => { clearTimeout(timer); stop(); reject(new Error('Bootstrap cancelled.')); };
       preflight.once('error', () => { clearTimeout(timer); reject(new Error('Could not start SSH authorization check.')); });
       preflight.once('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error('SSH authorization check failed. Verify SSH access first.')); });
     });
@@ -105,7 +129,7 @@ export function bootstrapRelay(config) {
     const sshArgs = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-T', '--', config.target, remotePtyCommand(config)];
     const command = [config.sshPath ?? 'ssh', ...sshArgs].map(shellQuote).join(' ');
     const helper = config.helper ?? fileURLToPath(new URL('../../target/debug/herdr-roam', import.meta.url));
-    const pending = offerProcess(helper, ['serve', '--protocols', 'webtransport-stream-v1', '--', command], {
+    const pending = offerProcess(helper, ['serve', '--protocols', TRANSPORT_PROTOCOL, '--', command], {
       ...process.env, HERDR_ROAM_LISTEN: '127.0.0.1', HERDR_ROAM_ALLOWED_ORIGIN: config.origin,
     });
     activeClose = pending.close;
@@ -143,10 +167,13 @@ export function probeServer(config) {
     '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', '-T', '--', config.target,
     `python3 -c ${shellQuote(SERVER_INFO_SCRIPT)}`,
   ], { stdio: ['ignore', 'pipe', 'ignore'] });
-  const close = () => { if (child.exitCode === null && child.signalCode === null) child.kill(); };
+  const stop = processStopper(child);
+  let rejectProbe;
+  const close = () => { rejectProbe?.(new Error('SSH stats probe cancelled.')); stop(); };
   const ready = new Promise((resolve, reject) => {
     let bytes = Buffer.alloc(0), settled = false;
-    const fail = error => { if (settled) return; settled = true; clearTimeout(timer); close(); reject(error); };
+    const fail = error => { if (settled) return; settled = true; clearTimeout(timer); stop(); reject(error); };
+    rejectProbe = fail;
     const timer = setTimeout(() => fail(new Error('SSH stats probe timed out.')), 5_000);
     child.once('error', () => fail(new Error('Could not start SSH stats probe.')));
     child.stdout.on('data', chunk => {

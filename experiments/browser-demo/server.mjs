@@ -1,174 +1,111 @@
 import { createServer } from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { bootstrapAttachment, probeServer } from './bootstrap.mjs';
+import { APPLICATION_PROTOCOL, TRANSPORT_PROTOCOL, parseArgs, validateConfig } from './backend/config.mjs';
+import { HttpError, secureHeaders, send, sendAsset, requireParentRequest, requireEmptyBody, readGeometry } from './backend/http.mjs';
+import { createAttachments } from './backend/attachments.mjs';
+import { createStatsSampler } from './backend/stats.mjs';
 
-const TYPES = { '/': ['index.html', 'text/html; charset=utf-8'],
-  '/client.js': ['client.js', 'text/javascript; charset=utf-8'],
-  '/client.css': ['client.css', 'text/css; charset=utf-8'] };
+export { parseArgs } from './backend/config.mjs';
 
-export function parseArgs(args) {
-  const config = { target: '', port: 8765, cols: 120, rows: 36, session: `browser-demo-${randomBytes(5).toString('hex')}` };
-  for (let i = 0; i < args.length; i++) {
-    const name = args[i];
-    if (name === '--relay') { config.relay = true; continue; }
-    if (!['--target', '--port', '--session', '--helper'].includes(name) || args[i + 1] === undefined) {
-      throw new Error('Usage: node server.mjs --target telperion [--port 8765] [--session browser-demo-name] [--relay] [--helper /path/to/herdr-roam]');
-    }
-    config[name.slice(2)] = name === '--port' ? Number(args[++i]) : args[++i];
-  }
-  if (!/^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$/.test(config.target)) throw new Error('Provide a normal SSH host/alias with --target.');
-  if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) throw new Error('Invalid port.');
-  if (!/^browser-demo-[A-Za-z0-9-]{1,48}$/.test(config.session)) throw new Error('Use a dedicated browser-demo-* session.');
-  return config;
-}
+const ASSETS = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/client.js', ['client.js', 'text/javascript; charset=utf-8']],
+  ['/client.css', ['client.css', 'text/css; charset=utf-8']],
+  ['/config.json', ['config.json', 'application/json; charset=utf-8']],
+]);
 
-function secretMatches(actual, expected) {
-  if (typeof actual !== 'string') return false;
-  const a = Buffer.from(actual), b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-async function geometry(req, config) {
-  let body = '';
-  for await (const bytes of req) {
-    body += bytes.toString('utf8');
-    if (Buffer.byteLength(body) > 256) throw new Error('Bootstrap body is too large.');
-  }
-  if (!body) return { cols: config.cols, rows: config.rows };
-  if (!(req.headers['content-type'] ?? '').startsWith('application/json')) throw new Error('Expected JSON geometry.');
-  let value;
-  try { value = JSON.parse(body); } catch { throw new Error('Invalid JSON geometry.'); }
-  if (!value || Array.isArray(value) || typeof value !== 'object' ||
-      Object.keys(value).some(key => !['cols', 'rows'].includes(key)) ||
-      !Number.isInteger(value.cols) || value.cols < 20 || value.cols > 500 ||
-      !Number.isInteger(value.rows) || value.rows < 5 || value.rows > 300) {
-    throw new Error('Only terminal geometry is accepted: cols 20–500 and rows 5–300.');
-  }
-  return { cols: value.cols, rows: value.rows };
-}
-
-export async function startDemo(config, { bootstrap = bootstrapAttachment, probe = probeServer } = {}) {
+/** Loopback parent: authenticated control requests, fixed SSH configuration, local assets. */
+export async function startDemo(input, {
+  bootstrap = bootstrapAttachment, probe = probeServer,
+  assetRoot = new URL('./dist/', import.meta.url),
+} = {}) {
+  const config = validateConfig(input);
   const nonce = randomBytes(32).toString('base64url');
-  let origin;
-  let attachment;
-  let pendingAttachment;
-  let starting = false;
-  let attachmentGeneration = 0;
+  const attachments = createAttachments(config, bootstrap);
+  const stats = createStatsSampler(config, probe);
   const parentStartedAt = new Date().toISOString(), parentStarted = performance.now();
-  let attachmentOpenedAt;
-  const cancelAttachment = () => {
-    attachmentGeneration++;
-    const pending = pendingAttachment, active = attachment;
-    pendingAttachment = undefined; attachment = undefined;
-    starting = false; attachmentOpenedAt = undefined;
-    pending?.close(); active?.close();
+  let origin, expectedHost, closing = false, closePromise;
+  const configuration = {
+    relay: Boolean(config.relay), target: config.target, session: config.session,
+    cols: config.cols, rows: config.rows, applicationProtocol: APPLICATION_PROTOCOL,
   };
-  let statsPending, cachedStats, statsCachedAt = 0;
-  const statsSnapshot = () => ({
-    target: config.target, session: config.session, relay: Boolean(config.relay),
-    parentStartedAt, parentUptimeSeconds: (performance.now() - parentStarted) / 1000,
-    attachment: { state: starting ? 'starting' : attachment ? 'offered' : 'idle', offeredAt: attachmentOpenedAt ?? null },
-    server: cachedStats?.server ?? null, sshProbeMs: cachedStats?.sshProbeMs ?? null, error: cachedStats?.error ?? null,
-    sampledAt: cachedStats?.sampledAt ?? null,
-  });
-  const send = (res, status, body, contentType = 'application/json; charset=utf-8') => {
-    res.writeHead(status, { 'Content-Type': contentType });
-    res.end(contentType.startsWith('application/json') ? JSON.stringify(body) : body);
-  };
-  const server = createServer(async (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
-    if (req.headers.host !== new URL(origin).host) return send(res, 403, { error: 'Unexpected Host.' });
-    if (req.url === '/configuration' && req.method === 'GET') return send(res, 200, { relay: Boolean(config.relay), target: config.target, session: config.session, cols: config.cols, rows: config.rows, applicationProtocol: 'herdr-browser-pty-v1' });
+
+  async function handle(req, res) {
+    secureHeaders(res);
+    // Errors after a rejected/aborted body must not become unhandled stream errors.
+    req.on('error', () => {});
+    if (closing) res.shouldKeepAlive = false;
+    res.once('finish', () => { if (closing) server.closeIdleConnections(); });
+    if (req.headers.host !== expectedHost) throw new HttpError(403, 'Unexpected Host.');
+    if (req.url === '/configuration' && req.method === 'GET') return send(res, 200, configuration);
+
     if (['/bootstrap', '/disconnect', '/stats'].includes(req.url)) {
-      if (req.method !== 'POST' || req.headers.origin !== origin ||
-          !secretMatches(req.headers['x-herdr-demo-token'], nonce)) {
-        return send(res, 403, { error: 'The launch link and a same-origin request are required.' });
-      }
-      if (req.url !== '/bootstrap' && (Number(req.headers['content-length'] ?? 0) !== 0 || req.headers['transfer-encoding'])) {
-        return send(res, 400, { error: 'This endpoint does not accept a request body.' });
-      }
+      requireParentRequest(req, origin, nonce); // Authorize before reading a body or invoking SSH.
+      if (req.url !== '/bootstrap') requireEmptyBody(req);
       if (req.url === '/stats') {
-        if (!cachedStats || performance.now() - statsCachedAt > 5_000) {
-          if (!statsPending) {
-            let sample;
-            try { sample = probe(config); }
-            catch { sample = { ready: Promise.reject(new Error('Could not start SSH stats probe.')), close() {} }; }
-            statsPending = sample;
-            sample.ready.then(remote => {
-              const { sshProbeMs, ...server } = remote;
-              delete server.sampledAt;
-              cachedStats = { server, sshProbeMs, sampledAt: new Date().toISOString() };
-            }, error => { cachedStats = { error: error.message, sampledAt: new Date().toISOString() }; })
-              .finally(() => { statsCachedAt = performance.now(); statsPending = undefined; });
-          }
-          try { await statsPending.ready; } catch {}
-        }
-        return send(res, 200, statsSnapshot());
+        const sampled = await stats.sample();
+        return send(res, 200, {
+          target: config.target, session: config.session, relay: Boolean(config.relay),
+          parentStartedAt, parentUptimeSeconds: (performance.now() - parentStarted) / 1000,
+          attachment: attachments.snapshot(), ...sampled,
+        });
       }
       if (req.url === '/disconnect') {
-        cancelAttachment();
+        attachments.cancel();
         return send(res, 200, { ok: true });
       }
-      if (starting || attachment) return send(res, 409, { error: 'An attachment is already open. Disconnect it first.' });
-      const observedGeneration = attachmentGeneration;
-      let size;
-      try { size = await geometry(req, config); } catch (error) { return send(res, 400, { error: error.message }); }
-      if (observedGeneration !== attachmentGeneration) return send(res, 409, { error: 'Bootstrap cancelled.' });
-      if (starting || attachment) return send(res, 409, { error: 'An attachment is already open. Disconnect it first.' });
-      const generation = ++attachmentGeneration;
-      starting = true;
+      if (attachments.busy) throw new HttpError(409, 'An attachment is already open. Disconnect it first.');
+      const generation = attachments.generation;
+      const abort = new AbortController();
+      const onClose = () => { if (!res.writableFinished) abort.abort(); };
+      res.once('close', onClose);
       try {
-        const pending = bootstrap({ ...config, ...size, origin });
-        pendingAttachment = pending;
-        res.once('close', () => {
-          if (!res.writableFinished) {
-            if (generation === attachmentGeneration) cancelAttachment();
-            else pending.close();
-          }
+        const size = await readGeometry(req, config);
+        const offer = await attachments.open(size, origin, generation, abort.signal);
+        return send(res, 200, {
+          protocol: TRANSPORT_PROTOCOL, relay: Boolean(config.relay), offer,
+          session: config.session, ...size, applicationProtocol: APPLICATION_PROTOCOL,
         });
-        const result = await pending.ready;
-        if (generation !== attachmentGeneration) {
-          result.close();
-          if (!res.destroyed) send(res, 409, { error: 'Bootstrap cancelled.' });
-          return;
-        }
-        if (res.destroyed) { result.close(); return; }
-        attachment = result;
-        attachmentOpenedAt = new Date().toISOString();
-        result.child?.once('exit', () => {
-          if (attachment === result) { attachment = undefined; attachmentOpenedAt = undefined; }
-        });
-        send(res, 200, { protocol: 'webtransport-stream-v1', relay: Boolean(config.relay), offer: result.offer,
-          session: config.session, cols: size.cols, rows: size.rows, applicationProtocol: 'herdr-browser-pty-v1' });
-      } catch (error) {
-        if (!res.destroyed) send(res, generation === attachmentGeneration ? 502 : 409,
-          { error: generation === attachmentGeneration ? error.message : 'Bootstrap cancelled.' });
-      } finally {
-        if (generation === attachmentGeneration) { starting = false; pendingAttachment = undefined; }
-      }
-      return;
+      } finally { res.off('close', onClose); }
     }
-    if (req.method !== 'GET' || !TYPES[req.url]) return send(res, 404, { error: 'Not found.' });
-    const [file, type] = TYPES[req.url];
-    try { send(res, 200, await readFile(new URL(`./dist/${file}`, import.meta.url)), type); }
-    catch { send(res, 503, { error: 'Build the local assets first: npm ci && npm run build' }); }
+
+    const asset = req.method === 'GET' ? ASSETS.get(req.url) : undefined;
+    if (!asset) throw new HttpError(404, 'Not found.');
+    const [file, type] = asset;
+    try { sendAsset(res, await readFile(new URL(file, assetRoot)), type); }
+    catch { throw new HttpError(503, 'Build the local assets first: npm ci && npm run build'); }
+  }
+
+  const server = createServer((req, res) => {
+    void handle(req, res).catch(error => {
+      // Rejected requests may still have unread bytes; close their own HTTP connection.
+      res.shouldKeepAlive = false;
+      const status = Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode <= 599
+        ? error.statusCode : 502;
+      send(res, status, { error: error instanceof Error ? error.message : 'Gateway request failed.' });
+    });
   });
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 15_000;
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(config.port, '127.0.0.1', resolve);
   });
   origin = `http://127.0.0.1:${server.address().port}`;
-  return { server, origin, nonce, url: `${origin}/#${nonce}`, close: async () => {
-    cancelAttachment();
-    statsPending?.close();
-    await new Promise(resolve => server.close(resolve));
+  expectedHost = new URL(origin).host;
+  return { server, origin, nonce, url: `${origin}/#${nonce}`, close() {
+    if (closePromise) return closePromise;
+    closing = true;
+    attachments.close(); stats.close();
+    closePromise = new Promise(resolve => {
+      const timer = setTimeout(() => server.closeAllConnections(), 1_000);
+      timer.unref();
+      server.close(() => { clearTimeout(timer); resolve(); });
+    });
+    return closePromise;
   } };
 }
 
@@ -182,7 +119,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     console.log('The fragment is a local launch capability. Do not share the link. Ctrl+C closes this parent app.');
     let closing = false;
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
-      if (closing) return; closing = true;
+      if (closing) return;
+      closing = true;
       await app.close();
       console.log(`The dedicated Herdr session ${config.session} remains on ${config.target}.`);
       process.exit(0);

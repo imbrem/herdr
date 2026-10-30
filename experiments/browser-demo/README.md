@@ -33,6 +33,23 @@ supplied through authenticated SSH, with no daemon or file installation. Assets
 are bundled locally, without a CDN. `--port 0` chooses a free loopback port;
 `--helper /path/to/herdr-roam` overrides the local helper in relay mode.
 
+## Code layout
+
+`src/client.js` only wires the components together:
+
+- `gateway-client.js`: bounded control-plane requests, public configuration and
+  tab-scoped launch credentials. It never redirects authenticated requests.
+- `terminal-session.js`: connection/reconnect cancellation and gateway cleanup.
+- `terminal-connection.js`: pinned WebTransport, ACK/COMMIT, framed I/O and metrics.
+- `terminal-view.js`: xterm, terminal input and responsive geometry.
+- `terminal-ui.js`: dialogs, status overlays and statistics presentation.
+- `frames.js`: bounded incremental terminal-frame decoding.
+
+The separate Node gateway is split into configuration, HTTP policy, attachment
+lifecycle and statistics modules. See [its contract](backend/README.md).
+The remote Python adapter owns only its dedicated TUI's PTY; it does not own or
+stop the detached Herdr runtime. Tests exercise both sides of these boundaries.
+
 ## Terminal controls
 
 - The grid fits the tab and resizes the remote PTY live.
@@ -65,6 +82,23 @@ ssh telperion 'herdr --session browser-demo-main'
 ```
 
 ## Pointing at servers and hosting
+
+`npm run build` produces a portable `dist/` directory with relative asset paths
+and a public `config.json`. It can be served below a URL prefix. By default the
+control API is on that same origin/path; a different HTTPS adapter is selected
+with:
+
+```sh
+npm run build -- --gateway https://gateway.example/api/
+```
+
+The configuration contains only the gateway base URL. It contains no credentials,
+and selecting a URL does not bypass the gateway's authentication or Origin policy.
+For same-origin reverse-proxy layouts, `config.json` can use a relative API prefix
+such as `{ "gateway": "/api/" }`. The local gateway remains loopback-only and
+same-origin; a public/cross-origin adapter is a separate deployment step. See
+[static hosting and authentication](STATIC-HOSTING.md) for a minimal private-token
+adapter followed by device keys, SSH-key imports and Caddy/OAuth integration.
 
 Today one gateway instance points at one explicitly configured SSH target and
 one persistent session. Use a stable port and session name for a daily terminal,

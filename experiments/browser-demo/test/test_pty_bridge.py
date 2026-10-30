@@ -1,6 +1,7 @@
 """Protocol and real PTY checks; no Herdr server or user session is used."""
 import importlib.util
 import os
+import random
 from pathlib import Path
 import selectors
 import signal
@@ -37,6 +38,41 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             decoder.feed(struct.pack('!BI', 1, pty_bridge.MAX_PAYLOAD + 1))
 
+    def test_invalid_control_headers_rejected_before_payload(self):
+        for kind, length in ((0, 65536), (255, 1), (2, 65536), (3, 7), (4, 0)):
+            with self.assertRaises(ValueError):
+                pty_bridge.FrameDecoder().feed(struct.pack('!BI', kind, length))
+
+    def test_randomized_stream_boundaries_preserve_frames(self):
+        rng = random.Random(1793)
+        expected = []
+        for _ in range(100):
+            kind = rng.choice((1, 1, 1, 2, 3))
+            length = {2: 4, 3: 8}.get(kind, rng.randrange(0, 4097))
+            expected.append((kind, bytes(rng.randrange(256) for _ in range(length))))
+        source = b''.join(pty_bridge.frame(kind, payload) for kind, payload in expected)
+        decoder, result, offset = pty_bridge.FrameDecoder(), [], 0
+        while offset < len(source):
+            length = rng.randrange(1, pty_bridge.IO_CHUNK + 1)
+            result.extend(decoder.feed(source[offset:offset + length]))
+            offset += length
+        self.assertEqual(result, expected)
+        self.assertEqual(decoder.pending, b'')
+
+    def test_input_headroom_handles_completion_plus_next_frame(self):
+        decoder = pty_bridge.FrameDecoder()
+        packet = pty_bridge.frame(1, b'a' * pty_bridge.MAX_PAYLOAD)
+        prefix = packet[:-1]
+        for offset in range(0, len(prefix), pty_bridge.IO_CHUNK):
+            self.assertEqual(decoder.feed(prefix[offset:offset + pty_bridge.IO_CHUNK]), [])
+        suffix = packet[-1:] + pty_bridge.frame(1, b'b' * (pty_bridge.IO_CHUNK - 6))
+        queue = bytearray(pty_bridge.MAX_QUEUED - pty_bridge.INPUT_HEADROOM)
+        completed = decoder.feed(suffix)
+        self.assertGreater(sum(len(payload) for _kind, payload in completed), pty_bridge.MAX_PAYLOAD)
+        for kind, payload in completed:
+            pty_bridge.receive(kind, payload, -1, queue, bytearray())
+        self.assertLessEqual(len(queue), pty_bridge.MAX_QUEUED)
+
     def test_geometry_and_control_validation(self):
         self.assertEqual(pty_bridge.geometry(20, 5), (20, 5))
         self.assertEqual(pty_bridge.geometry(500, 300), (500, 300))
@@ -65,6 +101,11 @@ assert sys.argv[1:]==['--session','browser-demo-unittest']
 assert 'HERDR_ENV' not in os.environ
 assert 'HERDR_SOCKET_PATH' not in os.environ
 tty.setraw(0)
+if os.environ.get('PTY_TEST_MODE')=='output-burst':
+ data=b'z'*(700*1024)
+ while data:
+  data=data[os.write(1,data):]
+ sys.exit(0)
 Path(os.environ['PTY_TEST_ROOT'],'tui.pid').write_text(str(os.getpid()))
 # Model a persistent daemon in another session, as Herdr's runtime is detached.
 runtime=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -84,7 +125,7 @@ while True:
         self.env.update(PATH=str(self.root) + os.pathsep + self.env['PATH'],
                         PTY_TEST_ROOT=str(self.root), HERDR_ENV='1',
                         HERDR_SOCKET_PATH='/not/a/live/socket')
-        self.decoder = pty_bridge.FrameDecoder()
+        self.decoder = pty_bridge.FrameDecoder(from_browser=False)
         self.output = bytearray()
         self.events = []
 
@@ -158,6 +199,42 @@ while True:
         os.kill(self.runtime_pid, 0)
         with self.assertRaises(ProcessLookupError):
             os.kill(tui_pid, 0)
+
+    def test_eof_closes_attachment_while_output_is_backpressured(self):
+        self.env['PTY_TEST_MODE'] = 'output-burst'
+        self.child = subprocess.Popen([sys.executable, str(SCRIPT), '--session',
+            'browser-demo-unittest'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=self.env)
+        # No output reader: stdout and the bounded application queue fill.
+        time.sleep(0.15)
+        self.child.stdin.close()
+        self.assertEqual(self.child.wait(timeout=3), 0, self.child.stderr.read().decode())
+
+    def test_slow_output_reader_drains_final_burst_without_loss(self):
+        self.env['PTY_TEST_MODE'] = 'output-burst'
+        self.child = subprocess.Popen([sys.executable, str(SCRIPT), '--session',
+            'browser-demo-unittest'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=self.env)
+        # Let stdout and the bridge's bounded queue fill before reading.
+        time.sleep(0.15)
+        selector = selectors.DefaultSelector()
+        selector.register(self.child.stdout, selectors.EVENT_READ)
+        output = bytearray()
+        deadline = time.monotonic() + 5
+        try:
+            while True:
+                if not selector.select(max(0, deadline - time.monotonic())):
+                    self.fail('slow-reader output did not finish')
+                data = os.read(self.child.stdout.fileno(), pty_bridge.IO_CHUNK)
+                if not data:
+                    break
+                for kind, payload in self.decoder.feed(data):
+                    if kind == pty_bridge.DATA:
+                        output.extend(payload)
+        finally:
+            selector.close()
+        self.assertEqual(self.child.wait(timeout=5), 0, self.child.stderr.read().decode())
+        self.assertEqual(output, b'z' * (700 * 1024))
 
     def test_untrusted_session_rejected_before_launch(self):
         result = subprocess.run([sys.executable, str(SCRIPT), '--session', 'default'],

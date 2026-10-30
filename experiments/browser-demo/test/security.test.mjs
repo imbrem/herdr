@@ -2,14 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { request } from 'node:http';
-import { mkdtemp, writeFile, rm, access } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { startDemo, parseArgs } from '../server.mjs';
-import { remoteCommand, validateGreeting, bootstrapRelay } from '../bootstrap.mjs';
-
-const fakeOffer = { version: 1, address: '127.0.0.1', port: 60000,
-  cert: Buffer.alloc(256, 1).toString('base64'), token: Buffer.alloc(32, 2).toString('base64') };
+import { startDemo } from '../server.mjs';
+import { fakeOffer } from './fixtures.mjs';
 
 test('Host, Origin and launch capability are required before any SSH bootstrap', async t => {
   let attempts = 0;
@@ -56,24 +50,6 @@ test('HTTP cannot choose a target or command and concurrent attachments are reje
   assert.equal(attempts, 1);
 });
 
-test('CLI uses a dedicated session and strict transport command', () => {
-  assert.throws(() => parseArgs(['--target', '-oProxyCommand=bad']));
-  assert.throws(() => parseArgs(['--target', 'fixture', '--session', 'default']));
-  const config = parseArgs(['--target', 'fixture']);
-  assert.match(config.session, /^browser-demo-/);
-  const command = remoteCommand({ ...config, origin: 'http://127.0.0.1:8765' });
-  assert.match(command, /HERDR_ROAM_ALLOWED_ORIGIN=/);
-  assert.match(command, /serve --protocols webtransport-stream-v1/);
-  assert.match(command, /python3 -u -c/);
-  assert.match(command, /browser-demo-/);
-});
-
-test('bootstrap rejects unknown selected protocols and invalid capabilities', () => {
-  assert.throws(() => validateGreeting({ selected_protocol: 'ssh', offer: fakeOffer }));
-  const greeting = { selected_protocol: 'webtransport-stream-v1', supported_protocols: ['webtransport-stream-v1'], offer: fakeOffer };
-  assert.equal(validateGreeting(greeting), fakeOffer);
-  assert.throws(() => validateGreeting({ ...greeting, offer: { ...fakeOffer, token: 'short' } }));
-});
 
 test('shutdown cancels an SSH bootstrap still waiting for its offer', async () => {
   let began, cancel;
@@ -120,14 +96,15 @@ test('disconnect rejects a late offer without clobbering a newer bootstrap', asy
   await firstStarted;
   assert.equal((await post('/disconnect')).status, 200);
   assert.equal(attempts[0].pendingCloses, 1);
+  // Cancellation settles before a delayed subprocess produces any offer.
+  assert.equal((await oldBootstrap).status, 409);
   assert.equal(await state(), 'idle');
 
   const newBootstrap = post('/bootstrap');
   await secondStarted;
   attempts[0].offer();
-  assert.equal((await oldBootstrap).status, 409);
-  assert.equal(attempts[0].resultCloses, 1);
   assert.equal(await state(), 'starting');
+  assert.equal(attempts[0].resultCloses, 1);
   assert.equal((await post('/bootstrap')).status, 409);
   assert.equal(attempts.length, 2);
 
@@ -142,24 +119,6 @@ test('disconnect rejects a late offer without clobbering a newer bootstrap', asy
   assert.equal(await state(), 'idle');
 });
 
-
-test('explicit relay requires SSH authorization before minting a local capability', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'herdr-browser-relay-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
-  const sshPath = join(dir, 'ssh'), helper = join(dir, 'helper'), marker = join(dir, 'helper-started');
-  await writeFile(sshPath, '#!/bin/sh\nexit 255\n', { mode: 0o700 });
-  await writeFile(helper, `#!/bin/sh\necho started > '${marker}'\n`, { mode: 0o700 });
-  const pending = bootstrapRelay({ target: 'fixture', sshPath, helper, origin: 'http://127.0.0.1:8765', session: 'browser-demo-test', cols: 120, rows: 36 });
-  await assert.rejects(pending.ready, /SSH authorization check failed/);
-  await assert.rejects(access(marker));
-});
-
-test('relay is an explicit CLI choice, not an automatic downgrade', () => {
-  assert.equal(parseArgs(['--target', 'fixture']).relay, undefined);
-  const config = parseArgs(['--target', 'fixture', '--relay', '--helper', '/fixed/helper']);
-  assert.equal(config.relay, true);
-  assert.equal(config.helper, '/fixed/helper');
-});
 
 
 test('bootstrap accepts bounded geometry only and snapshots it per attachment', async t => {
@@ -181,11 +140,53 @@ test('bootstrap accepts bounded geometry only and snapshots it per attachment', 
   assert.equal(data.applicationProtocol, 'herdr-browser-pty-v1');
 });
 
+test('oversized HTTP bodies return a complete error response without starting SSH', async t => {
+  let attempts = 0;
+  const app = await startDemo({ target: 'fixture', port: 0 }, {
+    bootstrap: () => { attempts++; throw new Error('must not start'); },
+  });
+  t.after(() => app.close());
+  const result = await fetch(`${app.origin}/bootstrap`, { method: 'POST',
+    headers: { Origin: app.origin, 'X-Herdr-Demo-Token': app.nonce, 'Content-Type': 'application/json' },
+    body: 'x'.repeat(257),
+  });
+  assert.equal(result.status, 413);
+  assert.equal((await result.json()).error, 'Bootstrap body is too large.');
+  assert.equal(attempts, 0);
+});
+
+test('disconnect during geometry upload invalidates the request before SSH can start', async t => {
+  let attempts = 0;
+  const app = await startDemo({ target: 'fixture', port: 0 }, {
+    bootstrap: () => { attempts++; throw new Error('must not start'); },
+  });
+  t.after(() => app.close());
+  const body = '{"cols":80,"rows":30}';
+  const headers = { Origin: app.origin, 'X-Herdr-Demo-Token': app.nonce,
+    'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+  const received = new Promise(resolve => app.server.once('request', resolve));
+  let upload;
+  const response = new Promise((resolve, reject) => {
+    upload = request(`${app.origin}/bootstrap`, { method: 'POST', headers }, res => { res.resume(); resolve(res.statusCode); });
+    upload.on('error', reject);
+    upload.write(body.slice(0, 1));
+  });
+  t.after(() => upload.destroy());
+  await received;
+  assert.equal((await fetch(`${app.origin}/disconnect`, { method: 'POST',
+    headers: { Origin: app.origin, 'X-Herdr-Demo-Token': app.nonce },
+  })).status, 200);
+  upload.end(body.slice(1));
+  assert.equal(await response, 409);
+  assert.equal(attempts, 0);
+});
+
 test('stats require authorization, coalesce probes and cache explicit remote measurements', async t => {
-  let count = 0, complete;
+  let count = 0, complete, began;
+  const started = new Promise(resolve => { began = resolve; });
   const pending = new Promise(resolve => { complete = resolve; });
   const app = await startDemo({ target: 'fixed-target', port: 0, session: 'browser-demo-stats', cols: 120, rows: 36 }, {
-    probe: config => { assert.equal(config.target, 'fixed-target'); count++; return { ready: pending, close() {} }; },
+    probe: config => { assert.equal(config.target, 'fixed-target'); count++; began(); return { ready: pending, close() {} }; },
   });
   t.after(() => app.close());
   assert.equal((await fetch(`${app.origin}/stats`, { method: 'POST' })).status, 403);
@@ -193,7 +194,7 @@ test('stats require authorization, coalesce probes and cache explicit remote mea
   const headers = { Origin: app.origin, 'X-Herdr-Demo-Token': app.nonce };
   const a = fetch(`${app.origin}/stats`, { method: 'POST', headers });
   const b = fetch(`${app.origin}/stats`, { method: 'POST', headers });
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await started;
   assert.equal(count, 1);
   complete({ hostname: 'real-remote', username: 'fixture', uptimeSeconds: 123, sshProbeMs: 31.5 });
   const first = await (await a).json(); await b;

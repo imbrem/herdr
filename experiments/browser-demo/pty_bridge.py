@@ -3,7 +3,14 @@
 
 Wire: type:u8, payload_length:u32be, payload. DATA=1, RESIZE=2 (cols/rows:u16be),
 PING/PONG=3 (8 opaque bytes), HEARTBEAT=4 (empty, server to client only).
+Browser sends DATA/RESIZE/PING; server sends DATA/PONG/HEARTBEAT. All integers
+are unsigned, network byte order. Maximum payload is 64 KiB; no terminal bytes
+are replayed after reconnect. A heartbeat proves this attachment loop is alive,
+not that a build or the persistent Herdr runtime is healthy.
+
 This is an application protocol inside the unchanged WebTransport byte stream.
+The two directional queues are capped at 256 KiB, with transport backpressure.
+The bridge owns only its TUI's PTY/process group, never the detached runtime.
 """
 import argparse
 import errno
@@ -11,6 +18,7 @@ import fcntl
 import os
 import pty
 import re
+import select
 import selectors
 import signal
 import struct
@@ -24,6 +32,8 @@ MAX_PAYLOAD = 64 * 1024
 MAX_QUEUED = 256 * 1024
 IO_CHUNK = 16 * 1024
 HEARTBEAT_SECONDS = 2.0
+# A read may finish a buffered maximum DATA frame and contain another chunk.
+INPUT_HEADROOM = MAX_PAYLOAD + IO_CHUNK
 SESSION_RE = re.compile(r'browser-demo-[A-Za-z0-9-]{1,48}\Z')
 
 
@@ -40,8 +50,9 @@ def frame(kind, payload=b''):
 
 
 class FrameDecoder:
-    def __init__(self):
+    def __init__(self, *, from_browser=True):
         self.pending = bytearray()
+        self.allowed = (DATA, RESIZE, PING) if from_browser else (DATA, PING, HEARTBEAT)
 
     def feed(self, data):
         # Callers supply at most IO_CHUNK bytes; malformed claimed sizes are
@@ -54,6 +65,11 @@ class FrameDecoder:
             kind, length = HEADER.unpack_from(self.pending)
             if length > MAX_PAYLOAD:
                 raise ValueError('terminal frame exceeds payload limit')
+            if (kind not in self.allowed or
+                    (kind == RESIZE and length != 4) or
+                    (kind == PING and length != 8) or
+                    (kind == HEARTBEAT and length != 0)):
+                raise ValueError('invalid browser terminal frame header')
             end = HEADER.size + length
             if len(self.pending) < end:
                 break
@@ -150,6 +166,11 @@ def stop_attachment(pid, reaped):
 def bridge(session, cols, rows):
     pid, master = spawn_attachment(session, cols, rows)
     selector = selectors.DefaultSelector()
+    # Observe pipe hangup even when backpressure temporarily disables reads.
+    # Otherwise a disconnected browser could leave a full output queue waiting
+    # forever for a reader that has already gone away.
+    stdin_hangup = select.poll()
+    stdin_hangup.register(0, select.POLLHUP | select.POLLERR)
     decoder, to_pty, to_browser = FrameDecoder(), bytearray(), bytearray()
     stopping = False
     reaped = False
@@ -180,6 +201,8 @@ def bridge(session, cols, rows):
         for fd in (0, 1, master):
             os.set_blocking(fd, False)
         while not stopping:
+            if stdin_hangup.poll(0):
+                break
             now = time.monotonic()
             if now >= next_heartbeat:
                 if len(to_browser) + HEADER.size <= MAX_QUEUED:
@@ -188,8 +211,8 @@ def bridge(session, cols, rows):
             if terminal_done and not to_browser:
                 break
             interest(0, selectors.EVENT_READ if not terminal_done and
-                     len(to_pty) <= MAX_QUEUED - MAX_PAYLOAD and
-                     len(to_browser) <= MAX_QUEUED - MAX_PAYLOAD else 0)
+                     len(to_pty) <= MAX_QUEUED - INPUT_HEADROOM and
+                     len(to_browser) <= MAX_QUEUED - INPUT_HEADROOM else 0)
             master_events = 0
             if not terminal_done:
                 if len(to_browser) <= MAX_QUEUED - IO_CHUNK - HEADER.size:
@@ -201,19 +224,30 @@ def bridge(session, cols, rows):
             for key, events in selector.select(min(0.25, max(0, next_heartbeat - now))):
                 fd = key.fd
                 if fd == 0:
-                    chunk = os.read(0, IO_CHUNK)
+                    try:
+                        chunk = os.read(0, IO_CHUNK)
+                    except BlockingIOError:
+                        continue
                     if not chunk:
                         stopping = True
                         break
                     for kind, payload in decoder.feed(chunk):
                         receive(kind, payload, master, to_pty, to_browser)
                 elif fd == 1:
-                    written = os.write(1, to_browser)
+                    try:
+                        written = os.write(1, to_browser)
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        stopping = True
+                        break
                     del to_browser[:written]
                 else:
                     if events & selectors.EVENT_READ:
                         try:
                             chunk = os.read(master, IO_CHUNK)
+                        except BlockingIOError:
+                            continue
                         except OSError as error:
                             if error.errno != errno.EIO:
                                 raise
@@ -224,8 +258,18 @@ def bridge(session, cols, rows):
                             terminal_done = True
                             to_pty.clear()
                     if events & selectors.EVENT_WRITE and to_pty and not terminal_done:
-                        written = os.write(master, to_pty)
-                        del to_pty[:written]
+                        try:
+                            written = os.write(master, to_pty)
+                        except BlockingIOError:
+                            continue
+                        except OSError as error:
+                            if error.errno not in (errno.EIO, errno.EPIPE):
+                                raise
+                            # The TUI exited while input was ready. Keep reading
+                            # the master so any final output can drain first.
+                            to_pty.clear()
+                        else:
+                            del to_pty[:written]
             if not reaped:
                 result, _status = os.waitpid(pid, os.WNOHANG)
                 reaped = result == pid
