@@ -3332,13 +3332,21 @@ fn bridge_transport_policy(preference: Option<&OsStr>) -> io::Result<BridgeTrans
         });
     }
     let protocols = preference.split(',').map(str::trim).collect::<Vec<_>>();
-    if protocols
-        .iter()
-        .any(|protocol| !matches!(*protocol, "ssh" | "webtransport-stream-v1"))
+    // The helper owns the supported-protocol registry. Keep core Herdr independent
+    // of experiment names so a new helper can add protocols without a TUI rebuild.
+    if protocols.len() > 16
+        || protocols.iter().any(|protocol| {
+            protocol.is_empty()
+                || protocol.len() > 64
+                || matches!(*protocol, "auto" | "webtransport")
+                || !protocol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "HERDR_TRANSPORT expects auto, ssh, or an ordered list of webtransport-stream-v1 and ssh",
+            "HERDR_TRANSPORT expects auto, ssh, or an ordered list of named transports",
         ));
     }
     // SSH is always available locally, so a first preference of SSH needs no negotiation.
@@ -3364,7 +3372,7 @@ fn select_bridge_transport(
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "HERDR_TRANSPORT requires webtransport-stream-v1, but herdr-roam is unavailable",
+                "HERDR_TRANSPORT requires a transport helper, but herdr-roam is unavailable",
             ))
         };
     };
@@ -3795,6 +3803,7 @@ mod tests {
             "webtransport",
             "webtransport-stream-v1,ssh",
             " webtransport-stream-v1 , ssh ",
+            "future-state-v2,webtransport-stream-v1,ssh",
         ] {
             assert_eq!(
                 bridge_transport_policy(Some(OsStr::new(preference))).unwrap(),
@@ -3810,8 +3819,8 @@ mod tests {
             }
         );
         for preference in [
-            "unknown",
-            "webtransport-stream-v1,unknown,ssh",
+            "bad/name",
+            "webtransport-stream-v1,bad name,ssh",
             "webtransport-stream-v1,",
             ",ssh",
             "auto,ssh",

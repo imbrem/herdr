@@ -15,10 +15,11 @@ git clone https://github.com/imbrem/herdr.git
 cd herdr
 git switch experiment/named-webtransport
 cargo build --locked -p herdr -p herdr-roam
+./scripts/try-webtransport --remote telperion  # auto, permits SSH fallback
+
+# Or require WebTransport explicitly:
 HERDR_TRANSPORT=webtransport-stream-v1 \
-HERDR_ROAM_BIN="$PWD/target/debug/herdr-roam" \
-env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
-  target/debug/herdr --remote telperion
+  ./scripts/try-webtransport --remote telperion
 ```
 
 On the remote machine, only the helper is new. It needs Rust, not Zig:
@@ -35,8 +36,9 @@ prototype does not handle servers behind unrelated NAT or SSH-only jump hosts.
 Neither command replaces stable Herdr. The experiment can attach through the
 existing server's endpoint compatibility negotiation.
 
-The development binary uses upstream's debug server identity. Keep it separate
-from production sockets as above. Do not stop or update a live stable server to
+The development binary uses upstream's debug server identity. The launcher clears
+inherited session/socket/caller routing from the surrounding Herdr pane; pass
+`--session NAME` explicitly if wanted. Do not stop or update a live stable server to
 try this helper. For saved-machine selection, launch the experimental client
 with the same environment variables before connecting its saved machines.
 
@@ -60,7 +62,9 @@ HERDR_TRANSPORT=ssh herdr --remote telperion
 
 We use `ssh` rather than `null` as the explicit name: absence can retain the
 legacy default, while logs and benchmark records should name what actually ran.
-Unknown names are configuration errors. A later named protocol is added alongside
+The helper owns the supported-protocol registry and rejects unknown local names;
+core Herdr only validates name syntax. Replacing the helper can add experiments
+without rebuilding the TUI. A later named protocol is added alongside
 old names, not by changing the meaning of an existing name.
 
 The SSH-authenticated bootstrap offers supported names and verifies a common
@@ -88,8 +92,11 @@ patched Herdr client.
 
 The helper is an optional executable. `HERDR_ROAM_BIN` selects its local path.
 The remote helper must be discoverable as `herdr-roam` in the remote SSH shell's
-PATH. The native prototype rejects browser Origin headers until a trusted HTTPS
-bootstrap and explicit Origin allowlist are implemented.
+PATH. The default rejects browser Origin headers. A trusted SSH bootstrap may opt one
+attachment into an exact canonical HTTP(S) Origin using
+`HERDR_ROAM_ALLOWED_ORIGIN`; wildcards and unscoped browser access are rejected.
+The browser demo uses this per-attachment setting with a protected loopback parent
+app. A production browser login still needs its own trusted auth/bootstrap service.
 
 No replacement of the long-lived Herdr server is needed: the helper invokes
 its existing authenticated stdio bridge after the new transport authenticates.
@@ -104,7 +111,8 @@ its existing authenticated stdio bridge after the new transport authenticates.
 - The server authenticates the capability before launching the selected user's
   bridge command. The network peer cannot choose a shell command or socket path.
 - Bootstrap/authentication sizes, timeouts, streams, and flow-control windows are
-  bounded. No 0-RTT input. Listeners are per attachment, not a permanent public
+  bounded. No 0-RTT input. All unauthenticated awaits share a hard deadline.
+  Listeners are per attachment, not a permanent public
   unauthenticated API. Tokens must not appear in argv, logs, or saved profiles.
 - An explicitly permitted SSH fallback preserves encryption and SSH identity
   checks. It can hide a failed experiment, so benchmarks must require a specific
@@ -136,6 +144,8 @@ mTLS is available. Server pinning and client authorization solve opposite sides
 of identity. Keep this extension under a new named handshake/auth capability;
 never silently reinterpret `webtransport-stream-v1` or weaken its SSH bootstrap.
 The current prototype does not implement this future key-verification adapter.
+A per-user listener can keep running without root; authorization should map grants
+to preconfigured sessions/sockets, never arbitrary client-supplied filesystem paths.
 
 ### What this does and does not do
 
@@ -155,6 +165,10 @@ Mosh's networking code is a C++ state synchronization engine coupled to its
 application state model, not a drop-in Rust stream library. Quinn is a simpler
 starting point for this fork; it does not by itself implement mosh's state sync. We use WebTransport from the
 start so datagrams and separate streams are available for later named contracts.
+
+For the concrete source boundaries and next display protocol, see
+[From a pipe to a mosh-style display](DISPLAY-TRANSPORT-DESIGN.md). For an
+experimental xterm.js client, see [the browser demo](experiments/browser-demo/README.md).
 
 ## Next experiment: state synchronization
 
@@ -195,3 +209,25 @@ network namespace. Never apply global packet loss to a live development server.
 Protocol candidates should have different names and strict selection for A/B
 runs, with security/integrity tests as hard constraints around the optimization
 objective.
+
+## Diagnostics
+
+`HERDR_ROAM_DEBUG=1` enables WebTransport setup metadata diagnostics in a helper.
+It is off by default; authentication capabilities and application bytes must not
+be logged. Strict transport selection is preferable to `auto` when diagnosing a
+network path, since automatic SSH fallback can otherwise hide failed UDP setup.
+
+Real Telperion-to-Prodigy testing selected strict `webtransport-stream-v1` and
+returned 262,144 binary bytes exactly, on two runs. An automatic native
+laptop-to-Telperion attachment stalled in TLS/HTTP3 setup, then successfully
+queried the existing Herdr API through SSH fallback before commitment. Direct
+Chrome-to-Telperion setup also stalled; the browser demo reports that failure
+instead of silently changing transports. The precise cause remains unresolved.
+Do not weaken certificate pinning to work around it.
+
+The explicit browser `--relay` mode was verified in Chrome: xterm.js rendered a
+real Telperion Herdr session, and typed shell input produced the expected output.
+That path is browser WebTransport to the loopback helper, then authenticated SSH
+to Telperion. It proves browser rendering and the browser-compatible handshake,
+but does not establish direct remote UDP connectivity or mosh-style state sync.
+Tests used a dedicated named session; existing Herdr servers were not restarted.

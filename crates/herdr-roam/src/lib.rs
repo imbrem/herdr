@@ -20,6 +20,33 @@ pub const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOKEN_LEN: usize = 32;
 pub const PROTOCOLS: &[&str] = &["webtransport-stream-v1", "ssh"];
 
+/// A browser origin is an exact canonical scheme/host/port tuple, never a URL path.
+pub fn validate_origin(value: &str) -> Result<String> {
+    if value.len() > 2048 {
+        bail!("allowed Origin is too long");
+    }
+    let url = url::Url::parse(value).context("invalid allowed Origin")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.origin().ascii_serialization() != value
+    {
+        bail!("allowed Origin must be a canonical http(s) scheme/host/port with no path, credentials, query or fragment");
+    }
+    Ok(value.to_owned())
+}
+
+pub fn origin_allowed(actual: Option<&str>, allowed: Option<&str>) -> bool {
+    match actual {
+        None => true,
+        Some(origin) => allowed == Some(origin),
+    }
+}
+
 pub fn parse_offered_protocols(value: &str) -> Result<Vec<String>> {
     let protocols: Vec<_> = value.split(',').map(|v| v.trim().to_owned()).collect();
     if protocols.len() > 16
@@ -127,10 +154,10 @@ impl Offer {
 
 fn transport() -> TransportConfig {
     let mut config = TransportConfig::default();
-    config.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
+    config.max_idle_timeout(Some(VarInt::from_u32(120_000).into()));
     config.keep_alive_interval(Some(Duration::from_secs(5)));
-    config.max_concurrent_bidi_streams(4u32.into());
-    config.max_concurrent_uni_streams(4u32.into());
+    config.max_concurrent_bidi_streams(16u32.into());
+    config.max_concurrent_uni_streams(16u32.into());
     config.stream_receive_window(VarInt::from_u32(1024 * 1024));
     config.receive_window(VarInt::from_u32(4 * 1024 * 1024));
     config.send_window(1024 * 1024);
@@ -200,6 +227,9 @@ pub async fn authenticate(
 ) -> Result<()> {
     let mut actual = [0; TOKEN_LEN];
     tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut actual)).await??;
+    // ring deprecated this public convenience API, not the constant-time
+    // implementation. Keep its vetted fixed-length comparison rather than
+    // introducing secret-dependent equality or implementing our own crypto.
     #[allow(deprecated)]
     ring::constant_time::verify_slices_are_equal(&actual, expected)
         .map_err(|_| anyhow::anyhow!("transport authentication rejected"))
@@ -249,6 +279,32 @@ pub fn bootstrap_command(remote: &str, protocols: &[String]) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, BufReader};
+
+    #[test]
+    fn browser_origin_allowlist_is_explicit_exact_and_canonical() -> Result<()> {
+        let origin = validate_origin("http://127.0.0.1:8765")?;
+        assert!(origin_allowed(None, None));
+        assert!(!origin_allowed(Some(&origin), None));
+        assert!(origin_allowed(Some(&origin), Some(&origin)));
+        assert!(!origin_allowed(
+            Some("http://127.0.0.1:8766"),
+            Some(&origin)
+        ));
+        for invalid in [
+            "null",
+            "*",
+            "file://localhost",
+            "https://example.com/",
+            "https://example.com/path",
+            "https://user@example.com",
+            "https://example.com?x",
+            "https://example.com#x",
+            "https://EXAMPLE.com",
+        ] {
+            assert!(validate_origin(invalid).is_err(), "accepted {invalid}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn named_protocol_selection_is_ordered_and_verified() -> Result<()> {

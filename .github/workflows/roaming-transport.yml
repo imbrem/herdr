@@ -21,3 +21,19 @@ jobs:
       - run: cargo test --locked --package herdr-roam
       - run: cargo build --locked --package herdr-roam
       - run: HERDR_ROAM_TEST_BIN="$PWD/target/debug/herdr-roam" python3 scripts/test_roaming_transport.py
+  browser-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: experiments/browser-demo
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: experiments/browser-demo/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build

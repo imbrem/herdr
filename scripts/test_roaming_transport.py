@@ -57,7 +57,7 @@ class TransportSmoke(unittest.TestCase):
         self.assertFalse((self.root / 'calls').exists())
         self.assertEqual(result.stdout, b'')
 
-    def test_committed_failure_never_falls_back_or_replays(self):
+    def test_committed_command_executes_once_without_fallback(self):
         self.env['HERDR_TRANSPORT'] = 'auto'
         self.ssh('printf "call\\n" >> "$ROAM_TEST_LOG"\nexec /bin/sh -c "$last"')
         # No input is necessary: command execution itself must occur only once.
@@ -67,6 +67,18 @@ class TransportSmoke(unittest.TestCase):
         self.assertEqual(marker.read_text(), 'ran\n', result.stderr.decode())
         self.assertEqual((self.root / 'calls').read_text(), 'call\n')
         self.assertIn(b'selected webtransport-stream-v1', result.stderr)
+
+    def test_peer_closing_during_input_does_not_fallback(self):
+        self.env['HERDR_TRANSPORT'] = 'auto'
+        self.ssh('printf "call\\n" >> "$ROAM_TEST_LOG"\nexec /bin/sh -c "$last"')
+        marker = self.root / 'early-close-count'
+        command = 'printf "ran\\n" >> ' + shlex.quote(str(marker))
+        # Peer closes while there is substantially more input than the flow-control window.
+        result = self.run_helper(b'x' * (8 * 1024 * 1024), command=command)
+        self.assertEqual(marker.read_text(), 'ran\n', result.stderr.decode())
+        self.assertEqual((self.root / 'calls').read_text(), 'call\n')
+        self.assertIn(b'selected webtransport-stream-v1', result.stderr)
+        self.assertNotIn(b'selected ssh', result.stderr)
 
     def test_unknown_protocol_fails_before_ssh(self):
         self.env['HERDR_TRANSPORT'] = 'bogus'

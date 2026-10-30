@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Herdr · browser transport lab</title><link rel="stylesheet" href="/client.css"></head>
+<body><main>
+<header><div><p class="eyebrow">HERDR / TRANSPORT LAB</p><h1>Your remote workspace, in a browser.</h1><p class="subtitle">A small WebTransport experiment. SSH grants access; your browser connects directly.</p></div><span class="badge">EXPERIMENTAL</span></header>
+<section class="toolbar"><div class="connection"><span id="dot" class="dot"></span><span id="status" role="status">Ready to connect</span></div><div><button id="connect">Connect</button><button id="disconnect" disabled>Disconnect</button></div></section>
+<section class="terminal-frame" aria-label="Remote Herdr terminal"><div class="terminal-top"><span id="session">Isolated browser-demo session</span><span>120 × 36 · WebTransport</span></div><div id="terminal"></div></section>
+<footer><span id="route">Direct encrypted connection · local SSH bootstrap · pinned server certificate</span><span id="detail">No connection yet</span></footer>
+<p class="note">The terminal uses a dedicated session on the remote machine. Disconnecting leaves its Herdr server running. Fixed terminal size for this first demo; use the keyboard or Herdr’s own mouse menu.</p>
+</main><script type="module" src="/client.js"></script></body></html>

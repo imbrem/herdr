@@ -18,6 +18,12 @@ mod platform;
 
 #[tokio::main]
 async fn main() {
+    if env::var_os("HERDR_ROAM_DEBUG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter("wtransport=debug")
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]).await,
@@ -61,6 +67,10 @@ async fn serve(args: &[String]) -> Result<i32> {
         );
         return Ok(0);
     }
+    let allowed_origin = env::var("HERDR_ROAM_ALLOWED_ORIGIN")
+        .ok()
+        .map(|origin| herdr_roam::validate_origin(&origin))
+        .transpose()?;
     platform::survive_bootstrap_disconnect();
     let server_ip: IpAddr = if let Ok(ip) = env::var("HERDR_ROAM_LISTEN") {
         ip.parse()?
@@ -85,31 +95,37 @@ async fn serve(args: &[String]) -> Result<i32> {
     std::io::stdout().flush()?;
     // A finite global bootstrap lifetime bounds unauthenticated public exposure.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let (connection, mut send, mut recv) = loop {
-        let incoming = tokio::time::timeout_at(deadline, endpoint.accept()).await?;
-        let request = match tokio::time::timeout(Duration::from_secs(2), incoming).await {
-            Ok(Ok(request)) => request,
-            _ => continue,
-        };
-        if request.path() != "/herdr-roam/v1" || request.origin().is_some() {
-            request.forbidden().await;
-            continue;
-        }
-        let connection = request.accept().await?;
-        let streams = tokio::time::timeout(Duration::from_secs(2), connection.accept_bi()).await;
-        let (send, mut recv) = match streams {
-            Ok(Ok(pair)) => pair,
-            _ => {
-                connection.close(1u32.into(), b"stream timeout");
-                continue;
+    let (connection, mut send, mut recv) = tokio::time::timeout_at(deadline, async {
+        // A scanner that completes TLS but never sends CONNECT must not monopolize
+        // the listener while the authenticated client is trying to negotiate.
+        let mut pending = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                incoming = endpoint.accept(), if pending.len() < 8 => {
+                    let allowed_origin = allowed_origin.clone();
+                    pending.spawn(async move {
+                        let request = tokio::time::timeout(Duration::from_secs(10), incoming).await??;
+                        if request.path() != "/herdr-roam/v1" || !herdr_roam::origin_allowed(request.origin(), allowed_origin.as_deref()) {
+                            request.forbidden().await;
+                            bail!("unexpected WebTransport path or Origin");
+                        }
+                        let connection = request.accept().await?;
+                        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(2), connection.accept_bi()).await??;
+                        if let Err(error) = authenticate(&mut recv, &token).await {
+                            connection.close(1u32.into(), b"authentication rejected");
+                            return Err(error);
+                        }
+                        Ok::<_, anyhow::Error>((connection, send, recv))
+                    });
+                }
+                attempt = pending.join_next(), if !pending.is_empty() => {
+                    if let Some(Ok(Ok(session))) = attempt {
+                        break Ok::<_, anyhow::Error>(session);
+                    }
+                }
             }
-        };
-        if authenticate(&mut recv, &token).await.is_err() {
-            connection.close(1u32.into(), b"authentication rejected");
-            continue;
         }
-        break (connection, send, recv);
-    };
+    }).await??;
     // No further accepts are performed; only this authenticated session is used.
     send.write_all(b"\x01").await?;
     // Authentication ACK is not a commitment: a lost ACK must never run the command.
