@@ -1,14 +1,15 @@
 import { spawn } from 'node:child_process';
 import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 
 export function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 export function remotePtyCommand({ session, cols, rows }) {
-  const tui = `stty rows ${rows} cols ${cols}; exec env TERM=xterm-256color COLORTERM=truecolor herdr --session ${shellQuote(session)}`;
-  return `script -qefc ${shellQuote(tui)} /dev/null`;
+  const source = readFileSync(new URL('./pty_bridge.py', import.meta.url), 'utf8');
+  return `python3 -u -c ${shellQuote(source)} --session ${shellQuote(session)} --cols ${cols} --rows ${rows}`;
 }
 
 export function remoteCommand(config) {
@@ -115,4 +116,55 @@ export function bootstrapRelay(config) {
 
 export function bootstrapAttachment(config) {
   return config.relay ? bootstrapRelay(config) : bootstrapOverSsh(config);
+}
+
+
+const SERVER_INFO_SCRIPT = `import getpass,json,os,platform,subprocess
+from pathlib import Path
+info={"hostname":platform.node(),"username":getpass.getuser(),"os":platform.system(),"kernel":platform.release(),"cpuCount":os.cpu_count()}
+try: info["uptimeSeconds"]=float(Path("/proc/uptime").read_text().split()[0])
+except (OSError,ValueError): pass
+try: info["loadAverage"]=list(os.getloadavg())
+except OSError: pass
+try:
+ m=dict(line.split(":",1) for line in Path("/proc/meminfo").read_text().splitlines())
+ info["memoryTotalBytes"]=int(m["MemTotal"].split()[0])*1024
+ info["memoryAvailableBytes"]=int(m["MemAvailable"].split()[0])*1024
+except (OSError,KeyError,ValueError): pass
+try: info["herdrVersion"]=subprocess.run(["herdr","--version"],capture_output=True,text=True,timeout=2,check=True).stdout.strip()[:128]
+except (OSError,subprocess.SubprocessError): pass
+print(json.dumps(info,separators=(",",":")))`;
+
+// This elapsed time includes SSH authentication/setup and remote command work.
+// It is NOT ICMP RTT or browser WebTransport RTT, particularly in relay mode.
+export function probeServer(config) {
+  const started = performance.now();
+  const child = spawn(config.sshPath ?? 'ssh', [
+    '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', '-T', '--', config.target,
+    `python3 -c ${shellQuote(SERVER_INFO_SCRIPT)}`,
+  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const close = () => { if (child.exitCode === null && child.signalCode === null) child.kill(); };
+  const ready = new Promise((resolve, reject) => {
+    let bytes = Buffer.alloc(0), settled = false;
+    const fail = error => { if (settled) return; settled = true; clearTimeout(timer); close(); reject(error); };
+    const timer = setTimeout(() => fail(new Error('SSH stats probe timed out.')), 5_000);
+    child.once('error', () => fail(new Error('Could not start SSH stats probe.')));
+    child.stdout.on('data', chunk => {
+      if (settled) return;
+      bytes = Buffer.concat([bytes, chunk]);
+      if (bytes.length > 8192) fail(new Error('SSH stats response exceeded its limit.'));
+    });
+    // Wait until stdout is drained as well as the process exiting.
+    child.once('close', code => {
+      if (settled) return;
+      if (code !== 0) return fail(new Error('SSH stats probe failed.'));
+      try {
+        const info = JSON.parse(bytes.toString('utf8'));
+        if (!info || typeof info.hostname !== 'string' || typeof info.username !== 'string') throw new Error('invalid');
+        settled = true; clearTimeout(timer);
+        resolve({ ...info, sampledAt: new Date().toISOString(), sshProbeMs: performance.now() - started });
+      } catch { fail(new Error('Invalid SSH stats response.')); }
+    });
+  });
+  return { ready, close };
 }

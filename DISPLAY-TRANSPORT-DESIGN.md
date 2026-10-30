@@ -114,8 +114,11 @@ and mouse commands need particular care; no predictions should send extra input.
 
 The first browser demo uses local xterm.js to render a genuine remote Herdr TUI in
 a PTY. This shares the real Herdr UI and avoids a premature browser implementation
-of endpoint codecs. It is still an ordered terminal byte stream and does not
-supply latest-state behavior.
+of endpoint codecs. Its separate `herdr-browser-pty-v1` adapter frames terminal
+data, live resize, echoed ping and remote heartbeat messages inside the unchanged
+transport. The browser fills the tab and keeps connection details in overlays.
+This gives a measurable, usable terminal, but its display is still an ordered
+terminal byte stream and does not supply latest-state behavior.
 
 A more integrated browser client should consume the structured snapshot/surface
 contract, render local navigation itself, and share the same state-stream logic

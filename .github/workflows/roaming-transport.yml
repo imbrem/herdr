@@ -36,4 +36,5 @@ jobs:
           cache-dependency-path: experiments/browser-demo/package-lock.json
       - run: npm ci
       - run: npm test
+      - run: python3 -m unittest discover -s test -p 'test_*.py'
       - run: npm run build

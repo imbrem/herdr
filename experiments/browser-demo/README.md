@@ -1,145 +1,128 @@
-# Browser transport lab
+# Herdr browser terminal
 
-A small browser client for the experimental Herdr WebTransport helper. It uses
-**native browser WebTransport and xterm.js**, with all JavaScript/CSS bundled
-locally. No browser extension, CDN, WebSocket relay, or terminal service account
-is needed.
+A fullscreen xterm.js terminal connected to a dedicated remote Herdr session.
+Connection controls live in the bottom-right corner. There is no page chrome
+around the terminal.
 
-The local Node process is the parent/auth adapter: it uses your existing SSH
-access to obtain a short-lived pinned attachment. In the default direct mode, the browser then talks directly
-to the remote UDP endpoint. This demo launches a stock Herdr TUI inside a Linux
-PTY, rather than decoding Herdr's native endpoint protocol in JavaScript.
+## Run
 
-## Try it
-
-Install the fork's `herdr-roam` helper on the remote machine first (see the
-repository's `TRANSPORT-EXPERIMENT.md`). Stock Herdr and the Linux `script` utility
-must be on the SSH user's PATH. This does not replace or restart stable Herdr.
+Build the fork's `herdr-roam` helper locally, then:
 
 ```sh
 cd experiments/browser-demo
 npm ci
 npm run build
-npm start -- --target telperion --port 0
+npm start -- --target telperion --session browser-demo-main --port 8765 --relay
 ```
 
-Open the local launch link printed in your terminal using a current Chrome or
-Edge with WebTransport support. Click **Connect**. The URL fragment is a local
-launch capability; do not share it. The page removes the fragment from its
-address bar after loading, so reopening/reloading requires the original link.
+Open the printed launch link in current Chrome or Edge and press **Connect**.
+The gateway uses the configured SSH alias and existing SSH authentication; there
+is no separate terminal password. SSH must work noninteractively. The launch
+capability stays in this tab's session storage so reloading works; it is removed
+from the address bar. Do not share the launch link.
 
-`--port 0` chooses a free loopback port. You can use a fixed port instead. The
-parent listens on **127.0.0.1 only**; use the exact printed IP, not `localhost`,
-because Host and Origin checks are deliberately exact.
+`--relay` explicitly selects browser WebTransport → loopback helper → SSH →
+remote Herdr. For direct browser-to-server WebTransport, omit `--relay` and install
+`herdr-roam` on the remote server. Direct mode requires reachable UDP 60000–61000.
+The direct laptop-to-Telperion path currently fails during setup; its cause is
+unresolved. Relay mode works on that path. Neither mode silently changes into
+the other.
 
-If the laptop's direct QUIC path is filtered, explicitly select the relay:
+The remote machine needs Python 3 and stock Herdr. The Python PTY adapter is
+supplied through authenticated SSH, with no daemon or file installation. Assets
+are bundled locally, without a CDN. `--port 0` chooses a free loopback port;
+`--helper /path/to/herdr-roam` overrides the local helper in relay mode.
+
+## Terminal controls
+
+- The grid fits the tab and resizes the remote PTY live.
+- Click the small server/latency control, or press **Alt+Shift+I**, for connection
+  details. Closing the dialog returns keyboard focus to the terminal.
+- **Reconnect** opens a fresh attachment and requests a fresh display. It keeps
+  the same named Herdr session and never restarts its server or replays input.
+- **Disconnect** closes the attachment; the named session and its work persist.
+- A banner appears after six seconds without a remote update. The remote PTY
+  adapter sends a heartbeat every two seconds, so a silent shell is not mistaken
+  for a stale connection.
+
+The details dialog shows session round-trip time, time since the last remote
+update, attachment duration, terminal byte counts and grid size. Its server-info
+section shows hostname, SSH user, uptime, load, kernel and Herdr version.
+
+Session RTT is an echoed message through the complete terminal path, including
+SSH in relay mode. A heartbeat proves the remote adapter is reachable; it does
+not prove that every pane or program inside Herdr is healthy. Server information
+comes from a fixed read-only SSH probe: it runs when details open, every ten
+seconds while open, or on **Refresh info**. Samples are coalesced and cached for
+five seconds. **SSH info check** includes connection/authentication and command
+execution; it is not network ping.
+
+The dedicated `browser-demo-*` server stays running after gateway shutdown.
+Reattach with:
 
 ```sh
-# First build the fork's helper locally with cargo build -p herdr-roam.
-npm start -- --target telperion --port 0 --relay
-# Optional trusted parent configuration: --helper /absolute/path/to/herdr-roam
+ssh telperion 'herdr --session browser-demo-main'
 ```
 
-Relay mode uses **browser WebTransport → localhost helper → authenticated SSH →
-remote Herdr**. It first verifies SSH access before minting a local capability,
-and the local helper starts the SSH PTY only after token authentication and
-COMMIT. This is labeled in the UI. It is a useful terminal/browser demo but does
-not measure end-to-end remote QUIC latency or migration. The default never
-silently changes into a relay. Only direct mode needs `herdr-roam` installed on
-the remote machine; relay mode needs it locally.
+## Pointing at servers and hosting
 
-Each parent process chooses a fresh `browser-demo-*` Herdr session. You may name
-it explicitly with `--session browser-demo-my-test`. Its PTY is fixed at 120 × 36
-cells for the first prototype. The terminal scrolls horizontally on small screens.
+Today one gateway instance points at one explicitly configured SSH target and
+one persistent session. Use a stable port and session name for a daily terminal,
+or separate gateway instances for different servers. HTTP requests cannot select
+a host, command, user, socket or filesystem path. Only validated terminal geometry
+is accepted at bootstrap.
 
-In direct mode, the remote helper must permit the attachment's exact page Origin. The parent
-supplies this in its authenticated SSH command via
-`HERDR_ROAM_ALLOWED_ORIGIN=http://127.0.0.1:<port>`. It does not enable a global
-browser Origin or relax native certificate checks.
+The maintainable hosted shape is a static terminal bundle plus a small same-origin
+auth/bootstrap adapter behind the existing employee login. Keep these boundaries:
 
-UDP 60000–61000 must be reachable directly from the browser. SSH-only jump hosts,
-UDP filtering, and some QUIC-inspecting networks can prevent the direct browser
-connection. Direct mode fails clearly; it cannot silently downgrade a
-browser WebTransport connection to SSH. The explicit relay can still demonstrate
-remote Herdr when the direct path is unavailable.
+1. A trusted configuration maps server profile IDs to permitted hosts and sessions.
+   The UI can eventually choose a profile ID; it must not submit an arbitrary SSH
+   target or shell command.
+2. The parent application authenticates the employee and authorizes a profile.
+   Its adapter returns a short-lived scoped attachment, certificate pin and
+   application-protocol name. SSH works as the first adapter; parent-managed key
+   proofs can replace it later without adding an account database to Herdr.
+3. The static terminal connects directly to the selected WebTransport endpoint.
+   An explicitly labeled relay can be a separate deployment option where direct
+   UDP is unavailable.
 
-## What stays running
+The current Node gateway deliberately binds only to **127.0.0.1** and checks that
+exact Host/Origin. It is not yet an internet-facing service: serving it behind a
+proxy requires configuring the public HTTPS origin and replacing the local launch
+capability with the parent's authenticated bootstrap/session. No public listener,
+login service or hiloop deployment is added by this prototype. A public browser
+client also needs a configured certificate-pinning/PKI strategy and per-user
+server authorization; do not expose the local SSH adapter unchanged.
 
-Disconnect closes the browser attachment and the parent's SSH helper. The
-**dedicated named Herdr server persists**, like any stock Herdr session. It never
-closes another user's server, the user's default session, or an existing pane.
-Ctrl+C stops the local parent process and any pending bootstrap. If you started
-work in the dedicated session, you can reattach over SSH:
+## Protocol and security
 
-```sh
-ssh telperion 'herdr --session browser-demo-your-name'
-```
+The transport remains `webtransport-stream-v1`. Inside its opaque byte stream,
+`herdr-browser-pty-v1` adds bounded DATA, RESIZE, PING/PONG and HEARTBEAT frames.
+This changes only the browser PTY adapter, not stock Herdr's endpoint codecs.
+It does not yet provide replaceable latest-screen state or predictive echo; see
+[the display protocol design](../../DISPLAY-TRANSPORT-DESIGN.md).
 
-To remove your own disposable demo session after all its work is finished, use
-stock Herdr's session/server management commands explicitly for that name. Do not
-stop the default server or another user's session as part of cleanup.
-
-## Security boundary
-
-- SSH authenticates the OS user and verifies the machine's SSH host key. HTTP
-  requests cannot choose a different target, shell command, session, or socket.
-- Bootstrap requires both the exact page Origin and a random local launch
-  capability. Host checks prevent DNS rebinding. There are no wildcard CORS
-  responses, externally hosted assets, or cached bootstrap responses.
-- The parent returns a seven-day P-256 certificate and an attachment-specific
-  random token obtained through SSH (direct mode) or minted locally after an SSH
-  authorization check (explicit relay). The browser hashes the exact certificate for
-  `serverCertificateHashes`, verifies the encrypted WebTransport connection, and
-  sends the token before any terminal input.
-- Authentication ACK is followed by irrevocable COMMIT. No fallback or input
-  replay occurs after commitment. The server opens only the PTY command chosen by
-  the SSH-authenticated parent.
-- The parent never prints attachment tokens, certificates, or arbitrary SSH output.
-  The launch fragment is printed locally because it is needed to open the app.
-- Native terminal input is bounded to 64 KiB of queued browser writes. Terminal
-  output respects xterm's parser backpressure rather than buffering indefinitely.
-- This is a local research demo, not an internet-facing login application. Browser
-  authorization via parent-provided public keys is a later auth adapter. Do not
-  expose this parent HTTP server publicly or replace the nonce with an open API.
-
-## Current limitations and architectural next step
-
-The first contract carries a reliable byte stream. xterm renders ANSI output
-from a real Herdr TUI, so it gives a useful browser demonstration immediately,
-but it adds a second terminal model and does not expose Herdr's panes/workspaces
-as native browser UI objects. Resize is fixed; clipboard integration, graphics,
-file transfer, and link opening have not been qualified.
-
-For a proper web client, keep Herdr's session/runtime model on the server and add
-a browser adapter for its negotiated endpoint/control messages. Alternatively,
-a server-rendered screen protocol can send replaceable, versioned screen state.
-Do not drop arbitrary ANSI bytes or existing Herdr delta frames: later output may
-depend on them. Reliable input/control and unreliable latest-screen presentation
-should have separate stream/datagram contracts and input acknowledgments.
+SSH authorizes each attachment. The browser pins its fresh P-256 certificate,
+authenticates with a random attachment token, then sends irrevocable COMMIT
+before terminal input. Host, exact Origin and a local launch capability protect
+the loopback bootstrap and stats endpoints. Remote commands/targets come only
+from trusted gateway configuration. Queues, frame sizes, geometry, probe output
+and authentication waits are bounded. Shutdown cleans up the gateway's own
+attachment/probes, while leaving persistent Herdr sessions running.
 
 ## Checks
 
 ```sh
 npm test
+python3 -m unittest discover -s test -p 'test_*.py'
 npm run build
 ```
 
-The Node tests prove that Host/Origin/nonce checks happen before any SSH process
-starts, HTTP cannot inject targets or commands, concurrent bootstrap is bounded,
-only dedicated sessions are used, malformed offers fail, and shutdown cancels a
-pending bootstrap. A real browser/remote smoke test is separate from these tests.
-
-### Recorded browser smoke test
-
-On 2026-10-30, Chrome on the development laptop successfully connected in
-**explicit relay mode**, rendered the actual dedicated Telperion Herdr session,
-and ran a shell command returning `HERDR_BROWSER_OK`. The parent app and the
-browser terminal remained live after the test. No existing Herdr session or
-server was restarted.
-
-Direct browser-to-Telperion WebTransport on that laptop path failed during the
-opening handshake, matching the native client's current direct-path failure.
-This does not establish the cause. The working relay is deliberately identified
-as local WebTransport plus remote SSH; it is not evidence of end-to-end remote
-WebTransport or mosh-style state synchronization. See the main transport guide
-for independent transport and server-to-server results.
+Tests cover authentication boundaries, geometry validation, stats authorization
+and caching, fragmented/malformed frames, actual PTY resizing, heartbeat/PONG and
+attachment cleanup. The six Python tests passed on macOS and Telperion/Linux.
+Chrome QA verified terminal input, live resize, server details and reconnecting
+to the same session, including after a page reload. Briefly pausing only the
+dedicated demo adapter produced the stale-update banner; resuming it cleared the
+banner automatically. Existing Herdr servers remained running. Clipboard,
+graphics, links and mobile keyboard behavior have not been fully qualified.

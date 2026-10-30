@@ -1,116 +1,312 @@
 import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-const terminal = new Terminal({ cols: 120, rows: 36, fontSize: 13,
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', cursorBlink: true,
-  disableStdin: true, scrollback: 2000, allowProposedApi: false,
-  theme: { background: '#0b0f16', foreground: '#d6deeb', cursor: '#b9d6ff', selectionBackground: '#3a5276' } });
-terminal.open(document.querySelector('#terminal'));
-terminal.writeln('\x1b[38;2;144;168;208mHerdr browser transport lab\x1b[0m\r\n');
-terminal.writeln('Connect to open a dedicated remote Herdr session.');
-terminal.writeln('Your existing workspaces are left alone.\r\n');
-const connectButton = document.querySelector('#connect'), disconnectButton = document.querySelector('#disconnect');
-const status = document.querySelector('#status'), dot = document.querySelector('#dot'), detail = document.querySelector('#detail');
-fetch('/configuration').then(result => result.json()).then(config => {
-  if (config.relay) {
-    document.querySelector('.subtitle').textContent = 'Explicit relay: browser WebTransport → localhost helper → authenticated SSH → remote Herdr.';
-    detail.textContent = 'Relay mode · remote leg uses SSH';
-    document.querySelector('#route').textContent = 'Encrypted local WebTransport · authenticated SSH upstream · pinned localhost certificate';
-  }
-}).catch(() => {});
-const nonce = location.hash.slice(1);
+import { DATA, RESIZE, PING, frame, FrameDecoder } from './frames.js';
+
+const $ = id => document.getElementById(id);
+const terminal = new Terminal({ cols: 120, rows: 36, fontSize: 14,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', cursorBlink: true,
+  disableStdin: true, scrollback: 3000, allowProposedApi: false,
+  theme: { background: '#0d0e11', foreground: '#d8dbe2', cursor: '#c0c9d9', selectionBackground: '#384252' } });
+const fit = new FitAddon();
+terminal.loadAddon(fit);
+terminal.open($('terminal'));
+
+let capability = location.hash.slice(1);
+try {
+  if (capability) sessionStorage.setItem('herdr-launch', capability);
+  else capability = sessionStorage.getItem('herdr-launch') ?? '';
+} catch { /* The launch link also works with browser storage disabled. */ }
 history.replaceState(null, '', location.pathname);
-let transport, streamWriter, outputReader;
-let sending = Promise.resolve(), queuedBytes = 0, generation = 0;
+
 const encoder = new TextEncoder();
-const decodeBase64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
-function setStatus(message, state = '') { status.textContent = message; dot.className = `dot ${state}`; }
-async function localRequest(path) {
-  const result = await fetch(path, { method: 'POST', headers: { 'X-Herdr-Demo-Token': nonce }, cache: 'no-store' });
+const decodeBase64 = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
+let configuration, current, generation = 0, connectedAt = 0, lastUpdate = 0;
+let receivedBytes = 0, sentBytes = 0, lastRtt, rtts = [], sequence = 0;
+let phase = 'disconnected', statsPending = false, serverInfo;
+
+function duration(seconds) {
+  if (!Number.isFinite(seconds)) return '—';
+  seconds = Math.max(0, Math.floor(seconds));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+  return `${Math.floor(seconds / 86400)}d ${Math.floor(seconds % 86400 / 3600)}h`;
+}
+function bytes(value) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MiB`;
+}
+function metric(value) { return Number.isFinite(value) ? `${Math.round(value)} ms` : '—'; }
+function showLogin(message = '') {
+  $('login-error').hidden = !message;
+  $('login-error').textContent = message;
+  if ($('details').open) $('details').close();
+  if (!$('login').open) $('login').showModal();
+}
+function focusTerminal() { if (phase === 'connected') terminal.focus(); }
+function setPhase(value, description) {
+  phase = value;
+  document.body.dataset.state = value;
+  $('connection-state').textContent = description;
+  $('stat-status').textContent = description;
+  $('login-status').textContent = value === 'connecting' ? description : 'SSH authentication';
+  $('connect').disabled = value === 'connecting';
+  $('reconnect').disabled = value === 'connecting' || !configuration || !capability;
+  $('details-reconnect').disabled = $('reconnect').disabled;
+  $('disconnect').disabled = value === 'disconnected';
+}
+async function request(path, body) {
+  const result = await fetch(path, { method: 'POST', cache: 'no-store', headers: {
+    'X-Herdr-Demo-Token': capability, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+  }, signal: AbortSignal.timeout(path === '/bootstrap' ? 30_000 : path === '/stats' ? 8000 : 3000),
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   const data = await result.json();
-  if (!result.ok) throw new Error(data.error ?? `Bootstrap failed (${result.status}).`);
+  if (!result.ok) throw new Error(data.error ?? `Request failed (${result.status}).`);
   return data;
 }
-function send(bytes) {
-  if (!streamWriter) return;
-  if (queuedBytes + bytes.byteLength > 64 * 1024) { void disconnect('Input queue full; reconnect before continuing.'); return; }
-  const active = generation, writer = streamWriter;
-  queuedBytes += bytes.byteLength;
-  sending = sending.then(async () => { if (active === generation) await writer.write(bytes); })
-    .catch(() => { if (active === generation) void disconnect('Connection lost; input was not replayed.'); })
-    .finally(() => { queuedBytes -= bytes.byteLength; });
+
+function sendFrame(type, payload, beforeWrite) {
+  const attachment = current;
+  if (!attachment?.writer || phase !== 'connected') return;
+  const packet = frame(type, payload);
+  if (attachment.queued + packet.length > 64 * 1024) {
+    void disconnect('Input queue full. Reconnect to continue.');
+    return;
+  }
+  attachment.queued += packet.length;
+  attachment.sending = attachment.sending.then(async () => {
+    if (current !== attachment) return;
+    beforeWrite?.();
+    await attachment.writer.write(packet);
+    if (type === DATA) sentBytes += payload.length;
+  }).catch(() => {
+    if (current === attachment) void disconnect('Connection lost.');
+  }).finally(() => { attachment.queued -= packet.length; });
 }
-terminal.onData(data => send(encoder.encode(data)));
-terminal.onBinary(data => send(Uint8Array.from(data, c => c.charCodeAt(0))));
-document.querySelector('#terminal').addEventListener('contextmenu', event => event.preventDefault());
-async function disconnect(message = 'Disconnected') {
+function sendInput(value) {
+  for (let offset = 0; offset < value.length; offset += 16 * 1024) {
+    sendFrame(DATA, value.subarray(offset, offset + 16 * 1024));
+  }
+}
+terminal.onData(data => sendInput(encoder.encode(data)));
+terminal.onBinary(data => sendInput(Uint8Array.from(data, char => char.charCodeAt(0))));
+$('terminal').addEventListener('contextmenu', event => event.preventDefault());
+
+function fitTerminal() {
+  const dimensions = fit.proposeDimensions();
+  if (!dimensions) return;
+  const cols = Math.max(20, Math.min(500, dimensions.cols));
+  const rows = Math.max(5, Math.min(300, dimensions.rows));
+  if (terminal.cols === cols && terminal.rows === rows) return;
+  terminal.resize(cols, rows);
+  const payload = new Uint8Array(4), view = new DataView(payload.buffer);
+  view.setUint16(0, cols); view.setUint16(2, rows);
+  sendFrame(RESIZE, payload);
+  $('stat-grid').textContent = `${cols} × ${rows}`;
+}
+let fitQueued = false;
+new ResizeObserver(() => {
+  if (fitQueued) return;
+  fitQueued = true;
+  requestAnimationFrame(() => { fitQueued = false; fitTerminal(); });
+}).observe($('terminal'));
+document.fonts.ready.then(fitTerminal);
+
+async function closeAttachment() {
   generation++;
+  const attachment = current;
+  current = undefined;
   terminal.options.disableStdin = true;
-  streamWriter = undefined;
-  try { transport?.close(); } catch {}
-  transport = undefined;
-  try { await outputReader?.cancel(); } catch {}
-  outputReader = undefined;
-  try { await localRequest('/disconnect'); } catch {}
-  connectButton.disabled = false;
-  disconnectButton.disabled = true;
-  setStatus(message);
+  connectedAt = 0; lastUpdate = 0;
+  try { attachment?.transport.close(); } catch {}
+  try { await attachment?.reader?.cancel(); } catch {}
+  if (capability) { try { await request('/disconnect'); } catch {} }
 }
-connectButton.addEventListener('click', async () => {
-  connectButton.disabled = true;
-  disconnectButton.disabled = false;
+async function disconnect(message = '') {
+  await closeAttachment();
+  setPhase('disconnected', 'Disconnected');
+  $('stale').hidden = true;
+  showLogin(message);
+}
+async function deadline(promise, milliseconds, message) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), milliseconds); })]); }
+  finally { clearTimeout(timer); }
+}
+async function connect() {
+  if (phase === 'connecting') return;
+  setPhase('connecting', 'Connecting…');
+  $('login-error').hidden = true;
+  const closingGeneration = generation + 1;
+  await closeAttachment();
+  if (generation !== closingGeneration) return;
   const active = ++generation;
-  let connection;
-  const guard = () => {
-    if (active !== generation) { try { connection?.close(); } catch {} throw new Error('Cancelled.'); }
-  };
+  const attachment = { sending: Promise.resolve(), queued: 0, pings: new Map() };
+  current = attachment;
+  const guard = () => { if (active !== generation || current !== attachment) throw new Error('Cancelled.'); };
   try {
-    if (!nonce) throw new Error('Open the launch link printed by the local parent app.');
-    if (!isSecureContext || !('WebTransport' in window)) throw new Error('This browser needs WebTransport support and a secure context. Try current Chrome or Edge.');
-    setStatus('Authenticating through SSH…');
-    const bootstrap = await localRequest('/bootstrap'), { offer } = bootstrap;
+    if (!configuration) throw new Error('Gateway configuration unavailable.');
+    if (!capability) throw new Error('Open the launch link from the gateway.');
+    if (!isSecureContext || !('WebTransport' in window)) throw new Error('WebTransport requires a supported browser and a secure context.');
+    fitTerminal();
+    setPhase('connecting', 'Authenticating…');
+    const bootstrap = await request('/bootstrap', { cols: terminal.cols, rows: terminal.rows });
     guard();
-    document.querySelector('#session').textContent = bootstrap.session;
+    if (bootstrap.applicationProtocol !== 'herdr-browser-pty-v1') throw new Error('Update the browser gateway and reload this tab.');
+    const { offer } = bootstrap;
     const address = offer.address.includes(':') ? `[${offer.address}]` : offer.address;
-    const url = `https://${address}:${offer.port}/herdr-roam/v1`;
-    const certificateHash = await crypto.subtle.digest('SHA-256', decodeBase64(offer.cert));
+    const hash = await crypto.subtle.digest('SHA-256', decodeBase64(offer.cert));
     guard();
-    connection = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: certificateHash }] });
-    transport = connection;
-    setStatus('Opening pinned WebTransport session…');
-    await Promise.race([connection.ready, new Promise((_, reject) => setTimeout(() => reject(new Error('WebTransport connection timed out. UDP 60000–61000 must be reachable.')), 10_000))]);
+    const transport = new WebTransport(`https://${address}:${offer.port}/herdr-roam/v1`, {
+      serverCertificateHashes: [{ algorithm: 'sha-256', value: hash }],
+    });
+    attachment.transport = transport;
+    setPhase('connecting', 'Opening transport…');
+    await deadline(transport.ready, 10_000, 'WebTransport connection timed out.');
     guard();
-    const stream = await connection.createBidirectionalStream();
+    const stream = await deadline(transport.createBidirectionalStream(), 5_000, 'Terminal stream timed out.');
     guard();
     const writer = stream.writable.getWriter(), reader = stream.readable.getReader();
-    outputReader = reader;
+    attachment.reader = reader;
     await writer.write(decodeBase64(offer.token));
-    const acknowledgment = await Promise.race([reader.read(), new Promise((_, reject) => setTimeout(() => reject(new Error('Remote authorization timed out.')), 5_000))]);
+    const acknowledgment = await deadline(reader.read(), 5_000, 'Server authorization timed out.');
     guard();
-    if (acknowledgment.done || acknowledgment.value?.[0] !== 1) throw new Error('Remote attachment authorization failed.');
-    await writer.write(new Uint8Array([1])); // Irrevocable COMMIT: no fallback/replay after this.
-    if (active !== generation) { connection.close(); return; }
-    streamWriter = writer;
+    if (acknowledgment.done || acknowledgment.value?.[0] !== 1) throw new Error('Server authorization failed.');
+    await writer.write(new Uint8Array([1])); // COMMIT; never replay input on reconnect.
+    guard();
+    attachment.writer = writer;
     terminal.reset();
-    if (acknowledgment.value.length > 1) terminal.write(acknowledgment.value.subarray(1));
     terminal.options.disableStdin = false;
+    receivedBytes = 0; sentBytes = 0; rtts = []; lastRtt = undefined;
+    connectedAt = performance.now(); lastUpdate = 0;
+    setPhase('connected', 'Connected');
+    $('login').close(); $('details').close();
     terminal.focus();
-    disconnectButton.disabled = false;
-    detail.textContent = bootstrap.relay ? 'WebTransport local + SSH remote relay · certificate pinned' : `${bootstrap.protocol} · direct · certificate pinned`;
-    setStatus('Connected', 'connected');
-    connection.closed.catch(() => {}).finally(() => { if (active === generation) void disconnect('Connection closed.'); });
-    while (active === generation) {
+    transport.closed.catch(() => {}).finally(() => {
+      if (current === attachment) void disconnect('Connection closed.');
+    });
+    const decoder = new FrameDecoder();
+    const present = async chunk => {
+      for (const message of decoder.push(chunk)) {
+        guard();
+        lastUpdate = performance.now();
+        if (message.type === DATA) {
+          receivedBytes += message.payload.length;
+          await new Promise(resolve => terminal.write(message.payload, resolve));
+        } else if (message.type === PING) {
+          const key = new DataView(message.payload.buffer).getBigUint64(0).toString();
+          const sent = attachment.pings.get(key);
+          if (sent !== undefined) {
+            lastRtt = performance.now() - sent;
+            rtts.push(lastRtt); if (rtts.length > 20) rtts.shift();
+            attachment.pings.delete(key);
+          }
+        }
+      }
+    };
+    if (acknowledgment.value.length > 1) await present(acknowledgment.value.subarray(1));
+    fitTerminal(); ping(); updateStatistics();
+    while (current === attachment) {
       const { value, done } = await reader.read();
-      if (done) break;
-      await new Promise(resolve => terminal.write(value, resolve));
+      if (done) { decoder.finish(); break; }
+      await present(value);
     }
-    if (active === generation) await disconnect('Remote attachment ended.');
+    if (current === attachment) await disconnect('Remote attachment ended.');
   } catch (error) {
-    if (active !== generation) return;
-    await disconnect(error.message);
-    dot.className = 'dot error'; detail.textContent = 'No session input was replayed';
+    if (active === generation && current === attachment) await disconnect(error.message);
   }
+}
+function ping() {
+  const attachment = current;
+  if (phase !== 'connected' || !attachment?.writer) return;
+  const now = performance.now();
+  for (const [key, sent] of attachment.pings) if (now - sent > 15_000) attachment.pings.delete(key);
+  if (attachment.pings.size >= 4) return;
+  const payload = new Uint8Array(8), key = BigInt(++sequence);
+  new DataView(payload.buffer).setBigUint64(0, key);
+  sendFrame(PING, payload, () => attachment.pings.set(key.toString(), performance.now()));
+}
+function updateStatistics() {
+  const now = performance.now(), age = lastUpdate ? (now - lastUpdate) / 1000 : Infinity;
+  const stale = phase === 'connected' && age > 6 && now - connectedAt > 6000;
+  document.body.dataset.state = stale ? 'stale' : phase;
+  $('stale').hidden = !stale;
+  if (stale) $('stale-text').textContent = lastUpdate ? `No server update · ${duration(age)}` : 'Waiting for server updates';
+  if (phase === 'connected') $('connection-state').textContent = stale ? `${duration(age)} stale` : metric(lastRtt).replace(' ms', 'ms');
+  $('stat-status').textContent = stale ? 'Waiting for server' : phase === 'connected' ? 'Connected' : phase === 'connecting' ? 'Connecting' : 'Disconnected';
+  $('stat-connected').textContent = connectedAt ? duration((now - connectedAt) / 1000) : '—';
+  $('stat-update').textContent = lastUpdate ? `${duration(age)} ago` : '—';
+  $('stat-rtt').textContent = rtts.length ? `${metric(lastRtt)} · avg ${metric(rtts.reduce((a, b) => a + b, 0) / rtts.length)}` : '—';
+  $('stat-bytes').textContent = `${bytes(receivedBytes)} / ${bytes(sentBytes)}`;
+  $('stat-grid').textContent = `${terminal.cols} × ${terminal.rows}`;
+  if (serverInfo) {
+    const { server, sampledAt } = serverInfo;
+    const sampleAge = Math.max(0, (Date.now() - Date.parse(sampledAt)) / 1000);
+    $('stat-uptime').textContent = server?.uptimeSeconds == null ? '—' : duration(server.uptimeSeconds + sampleAge);
+    $('stat-sampled').textContent = Number.isFinite(sampleAge) ? `${duration(sampleAge)} ago` : '—';
+    $('stat-parent').textContent = duration(serverInfo.parentUptimeSeconds + (now - serverInfo.receivedAt) / 1000);
+  }
+}
+async function refreshServerInfo() {
+  if (statsPending || !capability) return;
+  statsPending = true; $('refresh-stats').disabled = true;
+  try {
+    serverInfo = await request('/stats');
+    serverInfo.receivedAt = performance.now();
+    const server = serverInfo.server;
+    $('stat-hostname').textContent = server?.hostname ?? '—';
+    $('stat-user').textContent = server?.username ?? '—';
+    $('stat-kernel').textContent = server?.kernel ?? '—';
+    $('stat-version').textContent = server?.herdrVersion ?? '—';
+    $('stat-load').textContent = server?.loadAverage?.map(value => Number(value).toFixed(2)).join(' / ') ?? '—';
+    $('stat-probe').textContent = serverInfo.sshProbeMs == null ? '—' : `${metric(serverInfo.sshProbeMs)} · SSH + command`;
+    $('stats-error').hidden = !serverInfo.error;
+    $('stats-error').textContent = serverInfo.error ?? '';
+    updateStatistics();
+  } catch (error) {
+    $('stats-error').hidden = false; $('stats-error').textContent = error.message;
+  } finally { statsPending = false; $('refresh-stats').disabled = false; }
+}
+function openDetails() {
+  if ($('login').open) $('login').close();
+  if (!$('details').open) $('details').showModal();
+  updateStatistics(); void refreshServerInfo();
+}
+$('login-form').addEventListener('submit', event => { event.preventDefault(); void connect(); });
+$('login-close').addEventListener('click', () => { $('login').close(); focusTerminal(); });
+$('details-toggle').addEventListener('click', openDetails);
+$('details-close').addEventListener('click', () => { $('details').close(); focusTerminal(); });
+$('reconnect').addEventListener('click', () => void connect());
+$('stale-reconnect').addEventListener('click', () => void connect());
+$('details-reconnect').addEventListener('click', () => void connect());
+$('disconnect').addEventListener('click', () => void disconnect());
+$('refresh-stats').addEventListener('click', () => void refreshServerInfo());
+for (const dialog of [$('login'), $('details')]) dialog.addEventListener('close', focusTerminal);
+window.addEventListener('keydown', event => {
+  if (event.altKey && event.shiftKey && event.code === 'KeyI') { event.preventDefault(); openDetails(); }
 });
-disconnectButton.addEventListener('click', () => void disconnect());
-window.addEventListener('beforeunload', () => { try { transport?.close(); } catch {} });
-if (!nonce) { connectButton.disabled = true; setStatus('Open the local launch link to connect.'); }
+window.addEventListener('beforeunload', () => { try { current?.transport?.close(); } catch {} });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { ping(); fitTerminal(); } });
+setInterval(updateStatistics, 500);
+setInterval(ping, 3000);
+setInterval(() => { if ($('details').open) void refreshServerInfo(); }, 10_000);
+
+setPhase('disconnected', 'Disconnected');
+try {
+  const response = await fetch('/configuration', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error('Gateway configuration unavailable.');
+  configuration = await response.json();
+  $('target').value = configuration.target;
+  $('host').textContent = configuration.target;
+  document.title = `${configuration.target} · Herdr`;
+  $('login-route').textContent = configuration.relay ? 'WebTransport → SSH relay' : 'Direct WebTransport';
+  $('login-session').textContent = configuration.session;
+  $('stat-target').textContent = configuration.target;
+  $('stat-session').textContent = configuration.session;
+  $('stat-route').textContent = configuration.relay ? 'WebTransport → SSH relay' : 'Direct WebTransport';
+  setPhase('disconnected', 'Disconnected');
+  showLogin(capability ? '' : 'Open the launch link from the gateway.');
+} catch (error) { showLogin(error.message); }
