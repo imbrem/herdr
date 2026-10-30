@@ -1,0 +1,25 @@
+#!/bin/sh
+# Launch this checkout's experimental client without replacing stable Herdr.
+set -eu
+roam_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+roam_target_dir=${CARGO_TARGET_DIR:-"$roam_root/target"}
+case "$roam_target_dir" in
+  /*) ;;
+  *) roam_target_dir="$roam_root/$roam_target_dir" ;;
+esac
+for roam_program in herdr herdr-roam; do
+  if [ ! -x "$roam_target_dir/debug/$roam_program" ]; then
+    printf '%s\n' 'Build first: cargo build --locked -p herdr -p herdr-roam' >&2
+    exit 1
+  fi
+done
+export HERDR_TRANSPORT=${HERDR_TRANSPORT:-auto}
+export HERDR_ROAM_BIN="$roam_target_dir/debug/herdr-roam"
+# Start an independent experimental client even when called from a stable pane.
+# Select a named experimental session explicitly with --session NAME.
+# Preserve SSH_AUTH_SOCK, SSH configuration, and transport/bootstrap overrides.
+unset HERDR_SOCKET_PATH HERDR_CLIENT_SOCKET_PATH HERDR_SESSION HERDR_ENV \
+  HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_PANE_RUNTIME_ID \
+  HERDR_ACTIVE_WORKSPACE_ID HERDR_ACTIVE_TAB_ID HERDR_ACTIVE_PANE_ID \
+  HERDR_BIN_PATH HERDR_REMOTE_KEYBINDINGS
+exec "$roam_target_dir/debug/herdr" "$@"

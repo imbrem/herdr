@@ -10,6 +10,7 @@ use super::{
 };
 use base64::Engine as _;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -3269,10 +3270,30 @@ fn bridge_connection(
     if noninteractive {
         apply_noninteractive_ssh_options(&mut command);
     }
+    command.arg("-T").arg(target).arg(remote_command);
+    let transport = std::env::var_os("HERDR_TRANSPORT");
+    let policy = bridge_transport_policy(transport.as_deref())?;
+    let helper = if matches!(policy, BridgeTransportPolicy::Helper { .. }) {
+        find_roam_helper(
+            std::env::var_os("HERDR_ROAM_BIN").as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )
+    } else {
+        None
+    };
+    if policy
+        == (BridgeTransportPolicy::Helper {
+            allow_ssh_fallback: true,
+        })
+        && helper.is_none()
+    {
+        tracing::warn!("herdr-roam helper unavailable; using regular SSH transport");
+        if !noninteractive {
+            eprintln!("herdr: herdr-roam helper unavailable; using regular SSH transport");
+        }
+    }
+    let mut command = select_bridge_transport(command, policy, helper.as_deref())?;
     command
-        .arg("-T")
-        .arg(target)
-        .arg(remote_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if noninteractive {
@@ -3282,6 +3303,93 @@ fn bridge_connection(
         });
 
     bridge_child(stream, command, bridge_stop)
+}
+
+// Experimental opt-in transport lives outside the frozen endpoint protocol. The helper
+// owns SSH capability negotiation and may fall back only before consuming endpoint input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeTransportPolicy {
+    Ssh,
+    Helper { allow_ssh_fallback: bool },
+}
+
+fn bridge_transport_policy(preference: Option<&OsStr>) -> io::Result<BridgeTransportPolicy> {
+    let Some(preference) = preference else {
+        return Ok(BridgeTransportPolicy::Ssh);
+    };
+    let preference = preference
+        .to_str()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "HERDR_TRANSPORT must be UTF-8")
+        })?
+        .trim();
+    if preference.is_empty() || preference == "ssh" {
+        return Ok(BridgeTransportPolicy::Ssh);
+    }
+    if matches!(preference, "auto" | "webtransport") {
+        return Ok(BridgeTransportPolicy::Helper {
+            allow_ssh_fallback: true,
+        });
+    }
+    let protocols = preference.split(',').map(str::trim).collect::<Vec<_>>();
+    // The helper owns the supported-protocol registry. Keep core Herdr independent
+    // of experiment names so a new helper can add protocols without a TUI rebuild.
+    if protocols.len() > 16
+        || protocols.iter().any(|protocol| {
+            protocol.is_empty()
+                || protocol.len() > 64
+                || matches!(*protocol, "auto" | "webtransport")
+                || !protocol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HERDR_TRANSPORT expects auto, ssh, or an ordered list of named transports",
+        ));
+    }
+    // SSH is always available locally, so a first preference of SSH needs no negotiation.
+    if protocols[0] == "ssh" {
+        return Ok(BridgeTransportPolicy::Ssh);
+    }
+    Ok(BridgeTransportPolicy::Helper {
+        allow_ssh_fallback: protocols.contains(&"ssh"),
+    })
+}
+
+fn select_bridge_transport(
+    ssh: Command,
+    policy: BridgeTransportPolicy,
+    helper: Option<&Path>,
+) -> io::Result<Command> {
+    let BridgeTransportPolicy::Helper { allow_ssh_fallback } = policy else {
+        return Ok(ssh);
+    };
+    let Some(helper) = helper else {
+        return if allow_ssh_fallback {
+            Ok(ssh)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "HERDR_TRANSPORT requires a transport helper, but herdr-roam is unavailable",
+            ))
+        };
+    };
+    let mut command = Command::new(helper);
+    command.arg("connect").arg("--").args(ssh.get_args());
+    Ok(command)
+}
+
+fn find_roam_helper(requested: Option<&OsStr>, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    let default_name = format!("herdr-roam{}", std::env::consts::EXE_SUFFIX);
+    let requested = Path::new(requested.unwrap_or_else(|| OsStr::new(&default_name)));
+    if requested.components().count() > 1 || requested.is_absolute() {
+        return requested.is_file().then(|| requested.to_owned());
+    }
+    std::env::split_paths(search_path?)
+        .map(|directory| directory.join(requested))
+        .find(|candidate| candidate.is_file())
 }
 
 fn bridge_child(
@@ -3676,6 +3784,127 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_bridge_transport_policy_accepts_named_ordered_preferences() {
+        for preference in [
+            None,
+            Some(""),
+            Some("ssh"),
+            Some(" ssh , webtransport-stream-v1 "),
+        ] {
+            assert_eq!(
+                bridge_transport_policy(preference.map(OsStr::new)).unwrap(),
+                BridgeTransportPolicy::Ssh
+            );
+        }
+        for preference in [
+            "auto",
+            "webtransport",
+            "webtransport-stream-v1,ssh",
+            " webtransport-stream-v1 , ssh ",
+            "future-state-v2,webtransport-stream-v1,ssh",
+        ] {
+            assert_eq!(
+                bridge_transport_policy(Some(OsStr::new(preference))).unwrap(),
+                BridgeTransportPolicy::Helper {
+                    allow_ssh_fallback: true
+                }
+            );
+        }
+        assert_eq!(
+            bridge_transport_policy(Some(OsStr::new("webtransport-stream-v1"))).unwrap(),
+            BridgeTransportPolicy::Helper {
+                allow_ssh_fallback: false
+            }
+        );
+        for preference in [
+            "bad/name",
+            "webtransport-stream-v1,bad name,ssh",
+            "webtransport-stream-v1,",
+            ",ssh",
+            "auto,ssh",
+        ] {
+            assert_eq!(
+                bridge_transport_policy(Some(OsStr::new(preference)))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_bridge_transport_is_explicit_and_preserves_ssh_arguments() {
+        let make_ssh = || {
+            let mut command = Command::new("ssh");
+            command.args([
+                "-F",
+                "/config with spaces",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-T",
+                "user@host",
+                "exec '/remote path/herdr' --session agents remote-client-bridge",
+            ]);
+            command
+        };
+        let helper = Path::new("/opt/tools/herdr-roam");
+        let command =
+            select_bridge_transport(make_ssh(), BridgeTransportPolicy::Ssh, Some(helper)).unwrap();
+        assert_eq!(command.get_program(), "ssh");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            make_ssh().get_args().collect::<Vec<_>>()
+        );
+        for allow_ssh_fallback in [true, false] {
+            let command = select_bridge_transport(
+                make_ssh(),
+                BridgeTransportPolicy::Helper { allow_ssh_fallback },
+                Some(helper),
+            )
+            .unwrap();
+            assert_eq!(command.get_program(), helper);
+            let args = command.get_args().collect::<Vec<_>>();
+            assert_eq!(&args[..2], ["connect", "--"]);
+            assert_eq!(&args[2..], make_ssh().get_args().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn experimental_bridge_transport_missing_helper_respects_fallback_policy() {
+        let make_ssh = || {
+            let mut ssh = Command::new("ssh");
+            ssh.args(["-T", "host", "remote-client-bridge"]);
+            ssh
+        };
+        let command = select_bridge_transport(
+            make_ssh(),
+            BridgeTransportPolicy::Helper {
+                allow_ssh_fallback: true,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(command.get_program(), "ssh");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-T", "host", "remote-client-bridge"]
+        );
+        assert_eq!(
+            select_bridge_transport(
+                make_ssh(),
+                BridgeTransportPolicy::Helper {
+                    allow_ssh_fallback: false
+                },
+                None
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(find_roam_helper(Some(OsStr::new("/nonexistent/herdr-roam")), None).is_none());
+    }
 
     #[cfg(unix)]
     #[test]

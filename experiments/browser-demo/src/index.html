@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Herdr</title>
+  <link rel="stylesheet" href="./client.css">
+</head>
+<body>
+  <main id="terminal" aria-label="Remote terminal"></main>
+  <div id="stale" role="status" hidden><span id="stale-text"></span><button id="stale-reconnect">Reconnect</button></div>
+  <nav id="connection" aria-label="Connection controls">
+    <button id="details-toggle" title="Connection details · Alt+Shift+I" aria-label="Connection details"><span id="dot"></span><span id="host">Herdr</span><span id="connection-state">Disconnected</span></button>
+    <button id="reconnect" title="Reconnect for a fresh display" aria-label="Reconnect" disabled>↻</button>
+  </nav>
+  <dialog id="login" aria-labelledby="login-title">
+    <form id="login-form">
+      <div class="dialog-heading"><h1 id="login-title">Connect</h1><button id="login-close" class="icon-button" type="button" aria-label="Close connection dialog">×</button></div>
+      <label for="target">Server</label><input id="target" readonly autocomplete="off">
+      <div class="login-meta"><span id="login-route"></span><span id="login-session"></span></div>
+      <p id="login-error" class="error" role="alert" hidden></p>
+      <div class="actions"><span id="login-status" role="status">SSH authentication</span><button id="connect" class="primary" type="submit" autofocus>Connect</button></div>
+    </form>
+  </dialog>
+  <dialog id="details" aria-labelledby="details-title">
+    <div class="dialog-heading"><h2 id="details-title">Connection</h2><button id="details-close" class="icon-button" aria-label="Close details">×</button></div>
+    <dl id="statistics">
+      <dt>Server</dt><dd id="stat-target">—</dd>
+      <dt>Session</dt><dd id="stat-session">—</dd>
+      <dt>Transport</dt><dd id="stat-route">—</dd>
+      <dt>Status</dt><dd id="stat-status">Disconnected</dd>
+      <dt>Connected for</dt><dd id="stat-connected">—</dd>
+      <dt>Last server update</dt><dd id="stat-update">—</dd>
+      <dt>Terminal round trip</dt><dd id="stat-rtt">—</dd>
+      <dt>Received / sent</dt><dd id="stat-bytes">0 B / 0 B</dd>
+      <dt>Terminal</dt><dd id="stat-grid">—</dd>
+      <dt class="group">Host</dt><dd id="stat-hostname" class="group">—</dd>
+      <dt>SSH user</dt><dd id="stat-user">—</dd>
+      <dt>Server uptime</dt><dd id="stat-uptime">—</dd>
+      <dt>Load · 1 / 5 / 15 min</dt><dd id="stat-load">—</dd>
+      <dt>Kernel</dt><dd id="stat-kernel">—</dd>
+      <dt>Herdr</dt><dd id="stat-version">—</dd>
+      <dt>SSH info check</dt><dd id="stat-probe">—</dd>
+      <dt>Info sampled</dt><dd id="stat-sampled">—</dd>
+      <dt>Gateway uptime</dt><dd id="stat-parent">—</dd>
+    </dl>
+    <p id="stats-error" class="error" role="status" hidden></p>
+    <div class="actions"><button id="disconnect">Disconnect</button><button id="refresh-stats">Refresh info</button><button id="details-reconnect" class="primary">Reconnect</button></div>
+  </dialog>
+  <script type="module" src="./client.js"></script>
+</body>
+</html>
